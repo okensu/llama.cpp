@@ -264,6 +264,9 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // prompt position of the last periodic (--checkpoint-every) batch break
+    int64_t ckpt_every_last = -1;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
@@ -3785,6 +3788,11 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // the batch starts where the previous one was split by --checkpoint-every
+                    // (evaluated before filling, since filling may already record the next split)
+                    const bool is_every_start = params_base.checkpoint_every > 0 && slot.prompt.n_tokens() > 0 &&
+                                                (int64_t) slot.prompt.n_tokens() == slot.ckpt_every_last;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -3830,6 +3838,24 @@ private:
                             const auto & checkpoints = slot.prompt.checkpoints;
 
                             if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                                break;
+                            }
+                        }
+
+                        // [TAG_CHECKPOINT_EVERY] also break every checkpoint_every tokens inside messages, so that the
+                        // next batch can start with a checkpoint and an edit inside a long message can resume from it
+                        if (do_checkpoint && params_base.checkpoint_every > 0 && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                            const int64_t pos = slot.prompt.n_tokens();
+                            int64_t base = 0;
+                            if (!slot.prompt.checkpoints.empty() && slot.prompt.checkpoints.back().n_tokens <= pos) {
+                                base = slot.prompt.checkpoints.back().n_tokens;
+                            }
+                            // the break position itself counts as well, so a skipped checkpoint cannot cause 1-token batches
+                            if (slot.ckpt_every_last >= 0 && slot.ckpt_every_last <= pos) {
+                                base = std::max(base, slot.ckpt_every_last);
+                            }
+                            if (pos >= base + params_base.checkpoint_every) {
+                                slot.ckpt_every_last = pos;
                                 break;
                             }
                         }
@@ -3882,7 +3908,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_every_start) {
                             do_checkpoint = false;
                         }
                     }
@@ -3902,7 +3928,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_every_start ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
