@@ -466,6 +466,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    ggml_tensor * qkv_tokens = qkv_mixed; // [conv_channels, n_seq_tokens, n_seqs]
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
@@ -476,7 +478,33 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (mctx_cur->get_rs_recompute()) {
+        // [TAG_RECURRENT_ROLLBACK_RECOMPUTE] plane 0 <- conv state after the ubatch,
+        // plane 1 <- conv state before its last n_keep tokens, plus the conv inputs of those tokens
+        const int64_t n_keep = mctx_cur->get_rs_n_keep();
+        const int64_t n_tok  = ubatch.n_seq_tokens;
+        const int64_t n_rec  = std::min(n_tok, n_keep);
+
+        ggml_tensor * conv_state_last = ggml_view_3d(ctx0, conv_input,
+                conv_kernel_size - 1, conv_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, n_tok));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last,
+                ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1], kv_head * row_size)));
+
+        ggml_tensor * conv_state_base = n_tok <= n_keep ? conv_states : ggml_view_3d(ctx0, conv_input,
+                conv_kernel_size - 1, conv_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, n_tok - n_keep));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_base,
+                ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1], (mem_size + kv_head) * row_size)));
+
+        ggml_tensor * rin = mctx_cur->get_rin_l(il, llama_memory_recurrent::RS_IN_X);
+        GGML_ASSERT(rin->ne[0] == qkv_tokens->ne[0]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+                ggml_view_3d(ctx0, qkv_tokens, qkv_tokens->ne[0], n_rec, n_seqs,
+                    qkv_tokens->nb[1], qkv_tokens->nb[2], (n_tok - n_rec) * qkv_tokens->nb[1]),
+                ggml_view_3d(ctx0, rin, rin->ne[0], n_rec, n_seqs,
+                    rin->nb[1], n_keep * rin->nb[1], (size_t) kv_head * n_keep * rin->nb[1])));
+    } else if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -556,6 +584,67 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+
+        return output;
+    }
+
+    if (mctx_cur->get_rs_recompute()) {
+        // [TAG_RECURRENT_ROLLBACK_RECOMPUTE] plane 0 <- state after the ubatch, plane 1 <- state before its last
+        // n_keep tokens, plus the inputs of those tokens so that a rollback can recompute any prefix of them
+        const int64_t n_keep = mctx_cur->get_rs_n_keep();
+        const int64_t n_rec  = std::min<int64_t>(n_seq_tokens, n_keep);
+        const int64_t D      = S_v * S_v * H_v;
+
+        // K = n_keep + 1 exposes the state n_keep tokens back when the ubatch is longer than that
+        const int64_t K = n_seq_tokens > n_keep ? n_keep + 1 : 1;
+
+        GGML_ASSERT(g->ne[0] == 1 && "rollback recompute supports scalar gates only");
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+
+        const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+        ggml_tensor * state_last = ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+                ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, attn_score_elems));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_last,
+                ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], kv_head * row_size)));
+
+        ggml_tensor * state_base = K > 1
+            ? ggml_view_2d(ctx0, gdn_out, D, n_seqs,
+                    ggml_row_size(gdn_out->type, D), ggml_row_size(gdn_out->type, attn_score_elems + n_keep * D * n_seqs))
+            : ggml_reshape_2d(ctx0, s, D, n_seqs);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_base,
+                ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1], ((size_t) mem_size + kv_head) * row_size)));
+
+        auto record = [&](ggml_tensor * t, int idx) {
+            ggml_tensor * rin = mctx_cur->get_rin_l(il, idx);
+            GGML_ASSERT(rin->ne[0] == t->ne[0] * t->ne[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+                    ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], n_rec, n_seqs,
+                        t->nb[1], t->nb[2], t->nb[3], (n_seq_tokens - n_rec) * t->nb[2]),
+                    ggml_view_3d(ctx0, rin, rin->ne[0], n_rec, n_seqs,
+                        rin->nb[1], n_keep * rin->nb[1], (size_t) kv_head * n_keep * rin->nb[1])));
+        };
+        record(q, llama_memory_recurrent::RS_IN_Q);
+        record(k, llama_memory_recurrent::RS_IN_K);
+        record(v, llama_memory_recurrent::RS_IN_V);
+        record(g, llama_memory_recurrent::RS_IN_G);
+        record(b, llama_memory_recurrent::RS_IN_B);
 
         return output;
     }

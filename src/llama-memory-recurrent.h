@@ -4,8 +4,11 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include "ggml-alloc.h"
+
 #include <map>
 #include <set>
+#include <tuple>
 #include <vector>
 
 //
@@ -26,7 +29,7 @@ public:
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent();
 
     //
     // llama_memory_i
@@ -78,6 +81,14 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // rollback by recomputation (LLAMA_RS_RECOMPUTE=1, gated delta net models only):
+    // instead of (1 + n_rs_seq) snapshot planes, keep 2 planes - plane 0 holds the current state and plane 1 the
+    // state before the last rs_n_keep tokens of the previous ubatch - together with the gated delta net and conv
+    // inputs of those tokens. a rollback recomputes the kept prefix from plane 1 with the same kernel, which is
+    // bit-identical to the snapshot the fused kernel would have written.
+    bool     rs_recompute = false;
+    uint32_t rs_n_keep    = 0; // max tokens that can be rolled back into (n_rs_seq + 1)
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -90,6 +101,9 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // rs_recompute: number of recorded tokens that a rollback can recompute from plane 1 (0 = none)
+        uint32_t  rs_n_last = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -114,7 +128,23 @@ public:
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
+    // rs_recompute: inputs of the last rs_n_keep tokens per cell, one row per token ([n, rs_n_keep*size])
+    enum rs_input { RS_IN_Q, RS_IN_K, RS_IN_V, RS_IN_G, RS_IN_B, RS_IN_X, RS_IN_COUNT };
+    std::vector<ggml_tensor *> rin_l[RS_IN_COUNT];
+
 private:
+    // rs_recompute: recompute the state of cell after the first m recorded tokens into plane 0
+    bool rs_recompute_cell(uint32_t cell_id, uint32_t m);
+
+    struct rs_rc_graph {
+        ggml_context_ptr ctx;
+        ggml_cgraph *    gf     = nullptr;
+        ggml_gallocr_t   galloc = nullptr;
+    };
+
+    // one backend per device holding recurrent layers, and the cached recompute graphs per (device, cell, m)
+    std::map<ggml_backend_dev_t, ggml_backend_t> rc_backends;
+    std::map<std::tuple<ggml_backend_dev_t, uint32_t, uint32_t>, rs_rc_graph> rc_graphs;
     //const llama_model & model;
     const llama_hparams & hparams;
 
@@ -179,6 +209,10 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+
+    bool          get_rs_recompute() const;
+    uint32_t      get_rs_n_keep() const;
+    ggml_tensor * get_rin_l(int32_t il, int idx) const;
 
     int32_t s_copy(int i) const;
 

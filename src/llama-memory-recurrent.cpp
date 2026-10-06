@@ -35,6 +35,20 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    if (n_rs_seq > 0 && getenv("LLAMA_RS_RECOMPUTE") != nullptr && atoi(getenv("LLAMA_RS_RECOMPUTE")) != 0) {
+        // the recompute path is implemented in llm_build_delta_net_base for scalar-gate gated delta net layers
+        const bool supported = (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
+                               hparams.ple_conv_state() == 0 && hparams.n_embd_head_kda == 0;
+        if (supported) {
+            rs_recompute = true;
+            rs_n_keep    = n_rs_seq + 1;
+            LLAMA_LOG_INFO("%s: rollback by recomputation enabled (2 state planes instead of %u, up to %u tokens)\n",
+                    __func__, 1 + n_rs_seq, rs_n_keep);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_RS_RECOMPUTE is not supported for this model, using snapshots\n", __func__);
+        }
+    }
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -51,8 +65,10 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                // r and s per layer, plus the separate PLE conv row where the model has one,
+                // plus the recorded recompute inputs
+                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead() +
+                                         (rs_recompute ? RS_IN_COUNT*n_layer*ggml_tensor_overhead() : 0)),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -73,6 +89,9 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    for (auto & v : rin_l) {
+        v.resize(n_layer);
+    }
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -98,13 +117,28 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+        const uint32_t n_rows = mem_size * (rs_recompute ? 2 : 1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+
+        if (rs_recompute) {
+            GGML_ASSERT(type_r == GGML_TYPE_F32 && type_s == GGML_TYPE_F32);
+            const int64_t S_k  = hparams.ssm_d_state;
+            const int64_t H_k  = hparams.ssm_n_group;
+            const int64_t H_v  = hparams.ssm_dt_rank;
+            const int64_t S_v  = hparams.ssm_d_inner / H_v;
+            const int64_t n_ch = hparams.ssm_d_inner + 2*H_k*S_k;
+            const int64_t n_in[RS_IN_COUNT] = { S_k*H_k, S_k*H_k, S_v*H_v, H_v, H_v, n_ch };
+            const char *  names[RS_IN_COUNT] = { "q", "k", "v", "g", "b", "x" };
+            for (int j = 0; j < RS_IN_COUNT; ++j) {
+                rin_l[j][i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in[j], (int64_t) rs_n_keep*mem_size);
+                ggml_format_name(rin_l[j][i], "cache_rin_%s_l%d", names[j], i);
+            }
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -151,6 +185,7 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].rs_n_last = 0;
     }
 
     head = 0;
@@ -197,6 +232,19 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
 
+            // partial rollback by recomputing the kept tokens from plane 1
+            if (rs_recompute && 0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                const llama_pos rollback = cell.pos - (p0 - 1);
+                if (cell.seq_id.size() == 1 && rollback >= 1 && rollback <= (llama_pos) cell.rs_n_last) {
+                    if (!rs_recompute_cell((uint32_t) tail_id, cell.rs_n_last - (uint32_t) rollback)) {
+                        return false;
+                    }
+                    cell.pos       = p0 - 1;
+                    cell.rs_n_last = 0; // single-use, like the snapshot rollback
+                    return true;
+                }
+                return false;
+            }
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 // a cell shared by several sequences cannot move back for only one of them
@@ -431,6 +479,117 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT(idx <= n_rs_seq);
 
     rs_idx[seq_id] = idx;
+}
+
+llama_memory_recurrent::~llama_memory_recurrent() {
+    for (auto & [_, g] : rc_graphs) {
+        ggml_gallocr_free(g.galloc);
+    }
+    rc_graphs.clear();
+    for (auto & [_, be] : rc_backends) {
+        ggml_backend_free(be);
+    }
+}
+
+bool llama_memory_recurrent::rs_recompute_cell(uint32_t cell_id, uint32_t m) {
+    GGML_ASSERT(rs_recompute && m <= rs_n_keep && cell_id < size);
+
+    const int64_t S_k  = hparams.ssm_d_state;
+    const int64_t H_k  = hparams.ssm_n_group;
+    const int64_t H_v  = hparams.ssm_dt_rank;
+    const int64_t S_v  = hparams.ssm_d_inner / H_v;
+    const int64_t n_ch = hparams.ssm_d_inner + 2*H_k*S_k;
+    const int64_t n_cw = hparams.ssm_d_conv - 1; // conv window kept in the state
+    const int64_t D    = S_v*S_v*H_v;
+    GGML_ASSERT(n_cw*n_ch == (int64_t) hparams.n_embd_r() && D == (int64_t) hparams.n_embd_s());
+
+    // the layers of each device are recomputed with a graph on a backend of that device
+    std::map<ggml_backend_dev_t, std::vector<int>> layers_by_dev;
+    for (int il = 0; il < (int) s_l.size(); ++il) {
+        if (s_l[il] != nullptr) {
+            layers_by_dev[ggml_backend_buft_get_device(ggml_backend_buffer_get_type(s_l[il]->buffer))].push_back(il);
+        }
+    }
+
+    for (const auto & [dev, layers] : layers_by_dev) {
+        ggml_backend_t & backend = rc_backends[dev];
+        if (backend == nullptr) {
+            backend = dev ? ggml_backend_dev_init(dev, nullptr) : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            if (backend == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to initialize a backend for the recurrent state recompute\n", __func__);
+                return false;
+            }
+        }
+
+        rs_rc_graph & rc = rc_graphs[std::make_tuple(dev, cell_id, m)];
+        if (rc.gf == nullptr) {
+            const size_t n_max = 32*layers.size() + 16; // ~20 tensors (views, ops, copies) per layer
+            ggml_init_params params = {
+                /*.mem_size   =*/ n_max*ggml_tensor_overhead() + ggml_graph_overhead_custom(n_max, false),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            rc.ctx.reset(ggml_init(params));
+            ggml_context * ctx = rc.ctx.get();
+            rc.gf = ggml_new_graph_custom(ctx, n_max, false);
+
+            for (const int il : layers) {
+                ggml_tensor * r = r_l[il];
+                ggml_tensor * s = s_l[il];
+
+                // plane 1 (base) and plane 0 (current) rows of this cell
+                ggml_tensor * r_base = ggml_view_2d(ctx, r, n_cw, n_ch, n_cw*ggml_element_size(r), (size + cell_id)*r->nb[1]);
+                ggml_tensor * r_dst  = ggml_view_2d(ctx, r, n_cw, n_ch, n_cw*ggml_element_size(r),          cell_id *r->nb[1]);
+                ggml_tensor * s_dst  = ggml_view_2d(ctx, s, D, 1, s->nb[1], cell_id*s->nb[1]);
+
+                if (m == 0) {
+                    ggml_build_forward_expand(rc.gf, ggml_cpy(ctx, r_base, r_dst));
+                    ggml_build_forward_expand(rc.gf, ggml_cpy(ctx, ggml_view_2d(ctx, s, D, 1, s->nb[1], (size + cell_id)*s->nb[1]), s_dst));
+                    continue;
+                }
+
+                // the first m recorded tokens of this cell, in the layout the graph used
+                auto rin = [&](int j, int64_t ne0, int64_t ne1) {
+                    ggml_tensor * t = rin_l[j][il];
+                    return ggml_view_4d(ctx, t, ne0, ne1, m, 1,
+                            ne0*ggml_element_size(t), t->nb[1], t->nb[1]*m, (size_t) cell_id*rs_n_keep*t->nb[1]);
+                };
+
+                ggml_tensor * s_base = ggml_view_4d(ctx, s, S_v, S_v, H_v, 1,
+                        S_v*ggml_element_size(s), S_v*S_v*ggml_element_size(s), D*ggml_element_size(s), (size + cell_id)*s->nb[1]);
+
+                ggml_tensor * out = ggml_gated_delta_net(ctx,
+                        rin(RS_IN_Q, S_k, H_k), rin(RS_IN_K, S_k, H_k), rin(RS_IN_V, S_v, H_v),
+                        rin(RS_IN_G, 1, H_v), rin(RS_IN_B, 1, H_v), s_base, /*K=*/1);
+
+                ggml_tensor * new_state = ggml_view_2d(ctx, out, D, 1, D*ggml_element_size(out), S_v*H_v*m*ggml_element_size(out));
+                ggml_build_forward_expand(rc.gf, ggml_cpy(ctx, new_state, s_dst));
+
+                // conv state = last n_cw columns of [base conv state | first m recorded conv inputs]
+                ggml_tensor * x = rin_l[RS_IN_X][il];
+                x = ggml_view_2d(ctx, x, n_ch, m, x->nb[1], (size_t) cell_id*rs_n_keep*x->nb[1]);
+                ggml_tensor * conv_in = ggml_concat(ctx, r_base, ggml_transpose(ctx, x), 0);
+                ggml_tensor * conv_last = ggml_view_2d(ctx, conv_in, n_cw, n_ch, conv_in->nb[1], m*ggml_element_size(conv_in));
+                ggml_build_forward_expand(rc.gf, ggml_cpy(ctx, conv_last, r_dst));
+            }
+
+            rc.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(rc.galloc, rc.gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate the recurrent state recompute graph\n", __func__);
+                ggml_gallocr_free(rc.galloc);
+                rc_graphs.erase(std::make_tuple(dev, cell_id, m));
+                return false;
+            }
+        }
+
+        if (ggml_backend_graph_compute(backend, rc.gf) != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: recurrent state recompute failed\n", __func__);
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+    }
+
+    return true;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -725,6 +884,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
+    if (rs_recompute) {
+        // the graph records plane 1 and the inputs of the last min(n_seq_tokens, rs_n_keep) tokens of each seq cell;
+        // extra cells (copy destinations) only get their state copied, so they cannot be rolled back
+        for (uint32_t i = head; i < head + n; ++i) {
+            cells[i].rs_n_last = i < head + n_seqs ? std::min(n_seq_tokens, rs_n_keep) : 0;
+        }
+    }
+
     // sanity check
     return n >= n_seqs;
 }
@@ -894,6 +1061,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
+    }
+
+    // restored states have no recorded inputs to recompute from
+    for (auto & cell : cells) {
+        if (seq_id == -1 || cell.has_seq_id(seq_id)) {
+            cell.rs_n_last = 0;
+        }
     }
 }
 
@@ -1363,6 +1537,18 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+bool llama_memory_recurrent_context::get_rs_recompute() const {
+    return mem->rs_recompute;
+}
+
+uint32_t llama_memory_recurrent_context::get_rs_n_keep() const {
+    return mem->rs_n_keep;
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_rin_l(int32_t il, int idx) const {
+    return mem->rin_l[idx][il];
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
