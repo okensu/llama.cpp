@@ -2576,6 +2576,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
+
+        // the block-draft graph builds vocab-sized tensors for every token of the ubatch, so the compute buffer
+        // reserved for a 512-token ubatch is ~0.5 GiB although drafting only decodes n_max + 1 tokens per seq.
+        // a 64-token ubatch keeps the feature injection of long prompts just as fast while saving that VRAM.
+        result.n_ubatch = std::min(result.n_ubatch, std::max(64, params.n_parallel * per_seq));
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }
