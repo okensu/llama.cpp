@@ -3535,6 +3535,76 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// byte range [first, last + element) touched by a tensor
+static std::pair<uintptr_t, uintptr_t> ggml_cuda_byte_span(const ggml_tensor * t) {
+    uintptr_t hi = (uintptr_t) t->data + ggml_element_size(t);
+    for (int j = 0; j < GGML_MAX_DIMS; ++j) {
+        hi += (t->ne[j] - 1) * t->nb[j];
+    }
+    return { (uintptr_t) t->data, hi };
+}
+
+// run of consecutive f32 -> f32 copies (views in between) that do not touch each other's data: one kernel launch.
+// returns the number of nodes to skip, 0 if fewer than 2 copies were found
+static int ggml_cuda_try_cpy_batch(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_CPY_BATCH");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return 0;
+    }
+
+    const ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    const auto eligible = [&](const ggml_tensor * n) {
+        const ggml_tensor * s = n->src[0];
+        const ggml_tensor * d = n->src[1];
+        return n->op == GGML_OP_CPY && !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            s->type == GGML_TYPE_F32 && d->type == GGML_TYPE_F32 && ggml_nelements(s) > 0 &&
+            s->buffer && d->buffer && s->buffer->buft == buft && d->buffer->buft == buft;
+    };
+    const auto overlap = [](const std::pair<uintptr_t, uintptr_t> & a, const std::pair<uintptr_t, uintptr_t> & b) {
+        return a.first < b.second && b.first < a.second;
+    };
+
+    const ggml_tensor * srcs[CUDA_CPY_BATCH_MAX];
+    const ggml_tensor * dsts[CUDA_CPY_BATCH_MAX];
+    std::pair<uintptr_t, uintptr_t> src_span[CUDA_CPY_BATCH_MAX];
+    std::pair<uintptr_t, uintptr_t> dst_span[CUDA_CPY_BATCH_MAX];
+    int n = 0;
+    int last = i;
+
+    for (int j = i; j < cgraph->n_nodes && n < CUDA_CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (j > i && ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (!eligible(node)) {
+            break;
+        }
+        const auto ss = ggml_cuda_byte_span(node->src[0]);
+        const auto ds = ggml_cuda_byte_span(node->src[1]);
+        bool hazard = overlap(ss, ds);
+        for (int k = 0; k < n && !hazard; ++k) {
+            hazard = overlap(ss, dst_span[k]) || overlap(ds, src_span[k]) || overlap(ds, dst_span[k]);
+        }
+        if (hazard) {
+            break;
+        }
+        srcs[n] = node->src[0];
+        dsts[n] = node->src[1];
+        src_span[n] = ss;
+        dst_span[n] = ds;
+        ++n;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    ggml_cuda_cpy_batch(*cuda_ctx, srcs, dsts, n);
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3543,6 +3613,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CPY && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int nodes_to_skip = ggml_cuda_try_cpy_batch(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

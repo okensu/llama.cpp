@@ -624,3 +624,74 @@ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
 }
+
+struct cpy_batch_desc {
+    const char * src;
+    char       * dst;
+    int64_t      n;
+    int64_t      ne_s[4];
+    int64_t      nb_s[4];
+    int64_t      ne_d[4];
+    int64_t      nb_d[4];
+    int          contiguous; // both sides contiguous and 16-byte aligned with n % 4 == 0: copy float4
+};
+
+struct cpy_batch_args {
+    cpy_batch_desc d[CUDA_CPY_BATCH_MAX];
+};
+
+static __device__ __forceinline__ int64_t cpy_batch_offset(int64_t i, const int64_t * ne, const int64_t * nb) {
+    const int64_t i0 = i % ne[0]; i /= ne[0];
+    const int64_t i1 = i % ne[1]; i /= ne[1];
+    const int64_t i2 = i % ne[2];
+    const int64_t i3 = i / ne[2];
+    return i0*nb[0] + i1*nb[1] + i2*nb[2] + i3*nb[3];
+}
+
+static __global__ void cpy_f32_f32_batch(const __grid_constant__ cpy_batch_args args) {
+    const cpy_batch_desc & c = args.d[blockIdx.y];
+    const int64_t stride = (int64_t) gridDim.x*blockDim.x;
+    if (c.contiguous) {
+        const float4 * s = (const float4 *) c.src;
+        float4       * d = (float4       *) c.dst;
+        for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < c.n/4; i += stride) {
+            d[i] = s[i];
+        }
+        return;
+    }
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < c.n; i += stride) {
+        *(float *) (c.dst + cpy_batch_offset(i, c.ne_d, c.nb_d)) = *(const float *) (c.src + cpy_batch_offset(i, c.ne_s, c.nb_s));
+    }
+}
+
+void ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * srcs, const ggml_tensor * const * dsts, int n) {
+    GGML_ASSERT(n > 0 && n <= CUDA_CPY_BATCH_MAX);
+
+    cpy_batch_args args = {};
+    int64_t max_work = 0;
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * s = srcs[k];
+        const ggml_tensor * d = dsts[k];
+        GGML_ASSERT(s->type == GGML_TYPE_F32 && d->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(s) == ggml_nelements(d));
+
+        cpy_batch_desc & c = args.d[k];
+        c.src = (const char *) s->data;
+        c.dst = (char *) d->data;
+        c.n   = ggml_nelements(s);
+        for (int j = 0; j < 4; ++j) {
+            c.ne_s[j] = s->ne[j];
+            c.nb_s[j] = s->nb[j];
+            c.ne_d[j] = d->ne[j];
+            c.nb_d[j] = d->nb[j];
+        }
+        c.contiguous = ggml_is_contiguous(s) && ggml_is_contiguous(d) && c.n % 4 == 0 &&
+            (uintptr_t) c.src % 16 == 0 && (uintptr_t) c.dst % 16 == 0;
+        max_work = std::max(max_work, c.contiguous ? c.n/4 : c.n);
+    }
+
+    const int block_size = 256;
+    const int64_t nblocks = std::min<int64_t>((max_work + block_size - 1) / block_size, 1024);
+    cpy_f32_f32_batch<<<dim3((unsigned) nblocks, n), block_size, 0, ctx.stream()>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+}
