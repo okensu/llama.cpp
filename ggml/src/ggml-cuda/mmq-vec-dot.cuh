@@ -406,8 +406,37 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
     }
 
+    // The min term sum_k dmA.y*dsB.y of the 4 sub-blocks of this call is a small matmul of exact fp16 values:
+    // one f16 mma (k padded from 4 to 8 with zeros) per 16x8 tile instead of one FFMA per element and sub-block.
+    const int tig = threadIdx.x % 4;
+    int Amin[ntx][2];
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            const float m0 = tig == 0 ? dmA[n][l][0].y : (tig == 1 ? dmA[n][l][2].y : 0.0f);
+            const float m1 = tig == 0 ? dmA[n][l][1].y : (tig == 1 ? dmA[n][l][3].y : 0.0f);
+            const half2 h = __floats2half2_rn(m0, m1);
+            Amin[n][l] = *(const int *) &h;
+        }
+    }
+
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        {
+            const int jm = j0 + threadIdx.x/4;
+            half2 bm = make_half2(0.0f, 0.0f);
+            if (tig < 2) {
+                bm = __halves2half2(__high2half(y_dm[jm*MMQ_TILE_Y_K + 2*tig]), __high2half(y_dm[jm*MMQ_TILE_Y_K + 2*tig + 1]));
+            }
+            const int Bmin = *(const int *) &bm;
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                float * c = sum + (j0/tile_C::J + n)*tile_C::ne;
+                asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+                    : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(Amin[n][0]), "r"(Amin[n][1]), "r"(Bmin));
+            }
+        }
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
             tile_B   B;
@@ -430,7 +459,6 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
                 }
             }
         }
