@@ -405,6 +405,7 @@ struct llama_layer {
 
     // qwen3.5
     struct ggml_tensor * ssm_alpha = nullptr;
+    struct ggml_tensor * ssm_beta_alpha_view = nullptr; // [n_embd, 2*n_v_heads] over ssm_beta, ssm_alpha when adjacent
 
     // rwkv
     struct ggml_tensor * time_mix_w1         = nullptr;

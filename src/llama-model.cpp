@@ -1219,6 +1219,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // tensors that are views of loaded weights (no data of their own)
+    ggml_context_ptr ctx_weight_views;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1960,6 +1963,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    // ssm_beta and ssm_alpha share their input: if they are adjacent in memory, one matmul can cover both
+    // LLAMA_SSM_BA_FUSE=0 disables it
+    const char * env_ba_fuse = getenv("LLAMA_SSM_BA_FUSE");
+    if (env_ba_fuse == nullptr || atoi(env_ba_fuse) != 0) {
+        int n_fused = 0;
+        for (auto & layer : layers) {
+            ggml_tensor * b = layer.ssm_beta;
+            ggml_tensor * a = layer.ssm_alpha;
+            if (!b || !a || layer.ssm_beta_s || layer.ssm_alpha_s || layer.ssm_beta_in_s || layer.ssm_alpha_in_s ||
+                    b->type != a->type || b->ne[0] != a->ne[0] || b->buffer != a->buffer ||
+                    !ggml_is_contiguous(b) || !ggml_is_contiguous(a) || (const char *) b->data + ggml_nbytes(b) != a->data) {
+                continue;
+            }
+            if (!pimpl->ctx_weight_views) {
+                ggml_init_params vparams = { layers.size()*ggml_tensor_overhead(), nullptr, true };
+                pimpl->ctx_weight_views.reset(ggml_init(vparams));
+            }
+            ggml_tensor * t = ggml_new_tensor_2d(pimpl->ctx_weight_views.get(), b->type, b->ne[0], b->ne[1] + a->ne[1]);
+            ggml_format_name(t, "%s+alpha", b->name);
+            t->data   = b->data;
+            t->buffer = b->buffer;
+            layer.ssm_beta_alpha_view = t;
+            n_fused++;
+        }
+        if (n_fused > 0) {
+            LLAMA_LOG_INFO("%s: %d layers compute ssm_beta and ssm_alpha with one matmul\n", __func__, n_fused);
         }
     }
 
