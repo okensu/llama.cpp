@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -605,13 +606,24 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
+    if (ubatch.embd || cparams.inject_from_other) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
+        ggml_tensor * inp_target = nullptr;
+        if (cparams.inject_from_other) {
+            ggml_tensor * features = cparams.ctx_other->get_cparams().layer_inp_dev;
+            GGML_ASSERT(features != nullptr && features->ne[0] == n_embd_inp);
 
-        ggml_tensor * inp_target = inp->embd;
+            inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(inp->tokens);
+
+            inp_target = ggml_get_rows(ctx0, features, inp->tokens);
+        } else {
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+            ggml_set_input(inp->embd);
+
+            inp_target = inp->embd;
+        }
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));
@@ -872,13 +884,24 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // KV cache injection: fused target features from the encoder
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
+    if (ubatch.embd || cparams.inject_from_other) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
+        ggml_tensor * inp_target = nullptr;
+        if (cparams.inject_from_other) {
+            ggml_tensor * features = cparams.ctx_other->get_cparams().layer_inp_dev;
+            GGML_ASSERT(features != nullptr && features->ne[0] == n_embd_inp);
 
-        ggml_tensor * inp_target = inp->embd;
+            inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            ggml_set_input(inp->tokens);
+
+            inp_target = ggml_get_rows(ctx0, features, inp->tokens);
+        } else {
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+            ggml_set_input(inp->embd);
+
+            inp_target = inp->embd;
+        }
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));

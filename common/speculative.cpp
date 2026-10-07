@@ -987,6 +987,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
 
+    // ctx_tgt also keeps the target features on the GPU, see llama_set_layer_inp_dev
+    bool use_feat_dev = false;
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1117,6 +1120,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // also keep them on the GPU; batches that fit in one target ubatch then skip the host round trip
+        const char * env_feat_dev = getenv("LLAMA_DFLASH_FEAT_DEV");
+        if ((env_feat_dev == nullptr || atoi(env_feat_dev) != 0) && llama_get_ctx_other(ctx_dft) == ctx_tgt) {
+            use_feat_dev = llama_set_layer_inp_dev(ctx_tgt, target_layer_ids, (int32_t) target_layer_ids_n);
+        }
+        LOG_INF("%s: - target features on GPU: %s\n", __func__, use_feat_dev ? "yes" : "no");
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1190,6 +1200,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // the whole batch is still on the GPU: inject from there, ordered on the GPU instead of a host sync
+        const int32_t n_dev = use_feat_dev ? llama_get_layer_inp_dev_n_tokens(ctx_tgt) : 0;
+        if (n_dev > 0 && n_dev != n_tokens) {
+            // the host buffers were not filled for the last target decode
+            LOG_ERR("%s: target features on GPU are for %d tokens, batch has %d\n", __func__, (int) n_dev, (int) n_tokens);
+            return false;
+        }
+        const bool use_dev = n_dev > 0;
+        if (use_dev) {
+            llama_wait_for(ctx_dft, ctx_tgt);
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1205,6 +1227,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+                if (use_dev) {
+                    // token ids are the feature rows in the target's GPU buffer
+                    batch_inject.clear();
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t row = i_batch_beg[seq_id] + offset + i;
+                        batch_inject.add(row, batch_in.tokens[row].pos[0], seq_id, false);
+                    }
+                    llama_set_inject_from_other(ctx_dft, true);
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                    llama_set_inject_from_other(ctx_dft, false);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    continue;
+                }
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
@@ -1234,6 +1274,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
             }
+        }
+
+        // the next target decode overwrites the GPU features
+        if (use_dev) {
+            llama_wait_for(ctx_tgt, ctx_dft);
         }
 
         return true;

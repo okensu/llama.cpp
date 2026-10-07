@@ -59,6 +59,13 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // device copy of the inputs of layers layer_inp_dev_lids: F32 [n_embd*n_lids, n_ubatch], row i = token i of the ubatch
+    ggml_tensor * layer_inp_dev = nullptr;
+    std::vector<int32_t> layer_inp_dev_lids;
+
+    // DFlash: inject the target features from ctx_other->layer_inp_dev; the batch token ids are its row indices
+    bool inject_from_other = false;
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

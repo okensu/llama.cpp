@@ -889,6 +889,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.layer_inp_dev           == other.cparams.layer_inp_dev           &&
+            cparams.inject_from_other       == other.cparams.inject_from_other       &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1422,6 +1424,9 @@ struct llm_graph_context {
             ggml_tensor * dense_2,
             ggml_tensor * dense_2_b,
             ggml_tensor * dense_3) const;
+
+    // copy the layer inputs to cparams.layer_inp_dev
+    void build_layer_inp_dev() const;
 };
 
 // TODO: better name

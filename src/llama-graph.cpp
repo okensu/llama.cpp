@@ -3817,6 +3817,20 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
     return (llm_graph_input_mem_hybrid_iswa *) res->add_input(std::move(inp));
 }
 
+void llm_graph_context::build_layer_inp_dev() const {
+    ggml_tensor * dst = cparams.layer_inp_dev;
+    if (dst == nullptr) {
+        return;
+    }
+    for (size_t k = 0; k < cparams.layer_inp_dev_lids.size(); ++k) {
+        ggml_tensor * src = res->get_layer_inp(cparams.layer_inp_dev_lids[k]);
+        GGML_ASSERT(src != nullptr && src->type == GGML_TYPE_F32);
+        GGML_ASSERT(src->ne[1] <= dst->ne[1] && (int64_t) (k + 1) * src->ne[0] <= dst->ne[0]);
+        ggml_tensor * view = ggml_view_2d(ctx0, dst, src->ne[0], src->ne[1], dst->nb[1], k * src->ne[0] * ggml_element_size(dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, view));
+    }
+}
+
 void llm_graph_context::build_dense_out(
     ggml_tensor * dense_2,
     ggml_tensor * dense_2_b,

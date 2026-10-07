@@ -130,6 +130,18 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// keep the inputs of layers lids (in this order) on the GPU for the next decodes, returns false if not possible
+LLAMA_API bool llama_set_layer_inp_dev(struct llama_context * ctx, const int32_t * lids, int32_t n);
+
+// number of tokens of the last decode held on the GPU, 0 if the layer inputs went to the host buffers instead
+LLAMA_API int32_t llama_get_layer_inp_dev_n_tokens(struct llama_context * ctx);
+
+// DFlash draft: inject the target features from ctx_other's GPU copy, batch token ids are the row indices
+LLAMA_API void llama_set_inject_from_other(struct llama_context * ctx, bool value);
+
+// work submitted to ctx after this call waits on the GPU for the work already submitted to other
+LLAMA_API void llama_wait_for(struct llama_context * ctx, struct llama_context * other);
+
 //
 // model/context data extraction
 //

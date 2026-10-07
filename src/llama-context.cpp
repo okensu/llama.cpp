@@ -1272,6 +1272,79 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+bool llama_context::set_layer_inp_dev(const int32_t * lids, int32_t n) {
+    cparams.layer_inp_dev = nullptr;
+    cparams.layer_inp_dev_lids.clear();
+    layer_inp_dev_buf.reset();
+    layer_inp_dev_ctx.reset();
+    sched_need_reserve = true;
+
+    if (n <= 0) {
+        return true;
+    }
+
+    // all layer inputs must live on one GPU
+    ggml_backend_dev_t dev = nullptr;
+    for (int32_t k = 0; k < n; ++k) {
+        GGML_ASSERT(lids[k] >= 0 && (uint32_t) lids[k] <= model.hparams.n_layer());
+        ggml_backend_dev_t d = (uint32_t) lids[k] < model.hparams.n_layer() ? model.dev_layer(lids[k]) : model.dev_output();
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU || (dev != nullptr && d != dev)) {
+            return false;
+        }
+        dev = d;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    layer_inp_dev_ctx.reset(ggml_init(params));
+
+    ggml_tensor * t = ggml_new_tensor_2d(layer_inp_dev_ctx.get(), GGML_TYPE_F32, (int64_t) n * model.hparams.n_embd, cparams.n_ubatch);
+    ggml_set_name(t, "layer_inp_dev");
+
+    layer_inp_dev_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(layer_inp_dev_ctx.get(), ggml_backend_dev_buffer_type(dev)));
+    if (!layer_inp_dev_buf) {
+        layer_inp_dev_ctx.reset();
+        return false;
+    }
+    ggml_backend_buffer_clear(layer_inp_dev_buf.get(), 0);
+
+    cparams.layer_inp_dev = t;
+    cparams.layer_inp_dev_lids.assign(lids, lids + n);
+
+    LLAMA_LOG_INFO("%s: %d layer inputs x %u tokens on %s (%.2f MiB)\n", __func__, n, cparams.n_ubatch,
+            ggml_backend_dev_name(dev), ggml_backend_buffer_get_size(layer_inp_dev_buf.get()) / 1024.0 / 1024.0);
+
+    return true;
+}
+
+void llama_context::set_inject_from_other(bool value) {
+    cparams.inject_from_other = value;
+}
+
+void llama_context::wait_for(llama_context & other) {
+    for (auto & bo : other.backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(bo.get());
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        ggml_backend_event_t ev = ggml_backend_event_new(dev);
+        if (ev == nullptr) {
+            other.synchronize();
+            return;
+        }
+        ggml_backend_event_record(ev, bo.get());
+        for (auto & b : backends) {
+            if (ggml_backend_get_device(b.get()) == dev) {
+                ggml_backend_event_wait(b.get(), ev);
+            }
+        }
+        ggml_backend_event_free(ev);
+    }
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -1894,6 +1967,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // a batch that fits in one ubatch is fully kept in layer_inp_dev
+    layer_inp_dev_n_tokens = cparams.layer_inp_dev && n_tokens_all <= cparams.n_ubatch ? (int32_t) n_tokens_all : 0;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2037,7 +2113,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
-        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        // the GPU rows are in ubatch order: only usable if the batch is one ubatch in batch order
+        if (layer_inp_dev_n_tokens > 0) {
+            bool in_order = ubatch.n_tokens == (uint32_t) layer_inp_dev_n_tokens && ubatch.data;
+            for (uint32_t i = 0; in_order && i < ubatch.n_tokens; ++i) {
+                in_order = ubatch.data->batch_idxs[i] == (int32_t) i;
+            }
+            if (!in_order) {
+                layer_inp_dev_n_tokens = 0;
+            }
+        }
+
+        bool extract_all_idxs = layer_inp_dev_n_tokens == 0 && extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -4614,4 +4701,20 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_set_layer_inp_dev(struct llama_context * ctx, const int32_t * lids, int32_t n) {
+    return ctx->set_layer_inp_dev(lids, n);
+}
+
+int32_t llama_get_layer_inp_dev_n_tokens(struct llama_context * ctx) {
+    return ctx->get_layer_inp_dev_n_tokens();
+}
+
+void llama_set_inject_from_other(struct llama_context * ctx, bool value) {
+    ctx->set_inject_from_other(value);
+}
+
+void llama_wait_for(struct llama_context * ctx, struct llama_context * other) {
+    ctx->wait_for(*other);
 }

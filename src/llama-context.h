@@ -120,6 +120,15 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+
+    // keep the inputs of layers lids in a device buffer of n_ubatch rows (see llama_cparams::layer_inp_dev)
+    bool set_layer_inp_dev(const int32_t * lids, int32_t n);
+    int32_t get_layer_inp_dev_n_tokens() const { return layer_inp_dev_n_tokens; }
+
+    void set_inject_from_other(bool value);
+
+    // make the work submitted to this context wait for the work already submitted to other
+    void wait_for(llama_context & other);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -318,6 +327,12 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    ggml_context_ptr        layer_inp_dev_ctx;
+    ggml_backend_buffer_ptr layer_inp_dev_buf;
+
+    // tokens of the last decode in layer_inp_dev, 0 if the batch did not fit (host extraction was used)
+    int32_t layer_inp_dev_n_tokens = 0;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {
