@@ -127,7 +127,7 @@ struct llama_context {
 
     void set_inject_from_other(bool value);
 
-    // make the work submitted to this context wait for the work already submitted to other
+    // make the next decode/encode of this context wait on the GPU for the work already submitted to other
     void wait_for(llama_context & other);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -333,6 +333,10 @@ private:
 
     // tokens of the last decode in layer_inp_dev, 0 if the batch did not fit (host extraction was used)
     int32_t layer_inp_dev_n_tokens = 0;
+
+    // events recorded by wait_for(), waited on at the start of the next decode/encode
+    std::vector<std::pair<ggml_backend_dev_t, ggml_backend_event_t>> waits_pending;
+    void flush_waits();
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
 
     struct sampling_info {

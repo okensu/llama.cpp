@@ -504,6 +504,10 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    for (auto & [dev, ev] : waits_pending) {
+        ggml_backend_event_free(ev);
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -657,6 +661,10 @@ void llama_context::sched_reserve() {
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+
+    if (memory) {
+        memory->set_backends(backend_ptrs);
+    }
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
@@ -1336,6 +1344,12 @@ void llama_context::wait_for(llama_context & other) {
             return;
         }
         ggml_backend_event_record(ev, bo.get());
+        waits_pending.emplace_back(dev, ev);
+    }
+}
+
+void llama_context::flush_waits() {
+    for (auto & [dev, ev] : waits_pending) {
         for (auto & b : backends) {
             if (ggml_backend_get_device(b.get()) == dev) {
                 ggml_backend_event_wait(b.get(), ev);
@@ -1343,6 +1357,7 @@ void llama_context::wait_for(llama_context & other) {
         }
         ggml_backend_event_free(ev);
     }
+    waits_pending.clear();
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -1571,6 +1586,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    flush_waits();
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1810,6 +1827,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    flush_waits();
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

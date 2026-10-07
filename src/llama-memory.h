@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -81,6 +82,9 @@ struct llama_memory_i {
     using layer_share_cb = std::function<int32_t(int32_t il)>;
 
     virtual ~llama_memory_i() = default;
+
+    // backends of the owning context, for graphs the memory module computes itself
+    virtual void set_backends(const std::vector<ggml_backend_t> & backends) { GGML_UNUSED(backends); }
 
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them

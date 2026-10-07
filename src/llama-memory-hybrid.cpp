@@ -217,6 +217,10 @@ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }
 
+void llama_memory_hybrid::set_backends(const std::vector<ggml_backend_t> & backends) {
+    mem_recr->set_backends(backends);
+}
+
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }

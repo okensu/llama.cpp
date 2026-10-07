@@ -192,6 +192,7 @@ void llama_memory_recurrent::clear(bool data) {
     used = 0;
 
     if (data) {
+        rc_sync();
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -512,7 +513,15 @@ bool llama_memory_recurrent::rs_recompute_cell(uint32_t cell_id, uint32_t m) {
     }
 
     for (const auto & [dev, layers] : layers_by_dev) {
-        ggml_backend_t & backend = rc_backends[dev];
+        // prefer the context's backend: same stream as the next decode, so no host sync is needed
+        ggml_backend_t ctx_backend = nullptr;
+        for (ggml_backend_t b : ctx_backends) {
+            if (dev != nullptr && ggml_backend_get_device(b) == dev) {
+                ctx_backend = b;
+            }
+        }
+
+        ggml_backend_t & backend = ctx_backend ? ctx_backend : rc_backends[dev];
         if (backend == nullptr) {
             backend = dev ? ggml_backend_dev_init(dev, nullptr) : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
             if (backend == nullptr) {
@@ -582,14 +591,28 @@ bool llama_memory_recurrent::rs_recompute_cell(uint32_t cell_id, uint32_t m) {
             }
         }
 
-        if (ggml_backend_graph_compute(backend, rc.gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_graph_compute_async(backend, rc.gf) != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: recurrent state recompute failed\n", __func__);
             return false;
         }
-        ggml_backend_synchronize(backend);
+        if (ctx_backend) {
+            rc_pending = true;
+        } else {
+            ggml_backend_synchronize(backend);
+        }
     }
 
     return true;
+}
+
+void llama_memory_recurrent::rc_sync() {
+    if (!rc_pending) {
+        return;
+    }
+    for (ggml_backend_t b : ctx_backends) {
+        ggml_backend_synchronize(b);
+    }
+    rc_pending = false;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -1427,6 +1450,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 // the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
 // the transposed s layout is not handled - state_read_data() rejects it before any write
 void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count) {
+    rc_sync();
+
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     if (seq_id == -1) {
         clear(true);

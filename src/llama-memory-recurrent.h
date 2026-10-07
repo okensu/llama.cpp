@@ -31,6 +31,8 @@ public:
 
     ~llama_memory_recurrent();
 
+    void set_backends(const std::vector<ggml_backend_t> & backends) override { ctx_backends = backends; }
+
     //
     // llama_memory_i
     //
@@ -135,6 +137,13 @@ public:
 private:
     // rs_recompute: recompute the state of cell after the first m recorded tokens into plane 0
     bool rs_recompute_cell(uint32_t cell_id, uint32_t m);
+
+    // the context's backends: a recompute on one of them is ordered with the context's graphs on its stream
+    std::vector<ggml_backend_t> ctx_backends;
+
+    // a recompute may still run on a context backend: wait for it before writing the state from the host
+    bool rc_pending = false;
+    void rc_sync();
 
     struct rs_rc_graph {
         ggml_context_ptr ctx;
