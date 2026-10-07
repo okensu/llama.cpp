@@ -913,6 +913,61 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+#if defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_CUDA_MMQ_NO_PIPELINE)
+    // Q5_K: the raw data of the next x tile is fetched into registers before the MMA of the current tile
+    if constexpr (type == GGML_TYPE_Q5_K && prec_src1 == GGML_PREC_Q8) {
+        ggml_cuda_mmq_q5_K_raw<type, J, fallback> raw;
+        if (kb0_start < kb0_stop) {
+            ggml_cuda_mmq_fetch_q5_K<type, J, fallback>(x, raw, offset_x + kb0_start, tile_x_max_i, stride_row_x);
+        }
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            ggml_cuda_mmq_store_q5_K<type, J, fallback>(raw, tile_x, tile_x_max_i);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            if (kb0 + blocks_per_iter < kb0_stop) {
+                ggml_cuda_mmq_fetch_q5_K<type, J, fallback>(x, raw, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x);
+            }
+
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            __syncthreads();
+
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
+        }
+
+        if (fixup) {
+            write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
+        } else {
+            write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
+        }
+        return;
+    }
+#endif // defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_CUDA_MMQ_NO_PIPELINE)
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
