@@ -183,6 +183,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COPY,          // long drafts copied from the longest earlier match of the context suffix
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -367,6 +368,11 @@ struct common_params_speculative_ngram_map {
     uint16_t min_hits = 1;  // minimum hits at ngram/mgram lookup for mgram to be proposed
 };
 
+struct common_params_speculative_copy {
+    int32_t n_max     = 31; // maximum number of copied draft tokens (32-token verify batches)
+    int32_t min_match = 32; // minimum length in characters of the matched context text
+};
+
 struct common_params_speculative_ngram_cache {
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
@@ -388,6 +394,8 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    common_params_speculative_copy copy;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -401,7 +409,16 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n_rs_seq = needs_rs_seq ? draft.n_max : 0u;
+
+        // long copy drafts need a rollback depth of their own; only affordable when rollback recomputes the state
+        const char * rs_recompute = getenv("LLAMA_RS_RECOMPUTE");
+        const bool has_copy = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_COPY) != types.end();
+        if (has_copy && rs_recompute != nullptr && atoi(rs_recompute) != 0) {
+            n_rs_seq = std::max(n_rs_seq, (uint32_t) copy.n_max);
+        }
+
+        return n_rs_seq;
     }
 };
 

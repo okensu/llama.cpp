@@ -1393,6 +1393,9 @@ private:
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            // drafters without a draft model can still read the target vocab
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {

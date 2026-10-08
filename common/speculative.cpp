@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <unordered_map>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -80,7 +81,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"copy",          COMMON_SPECULATIVE_TYPE_COPY}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -2147,6 +2149,220 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 };
 
+// long drafts copied from the longest earlier match of the context text
+// the text drops the line number prefixes of file listings ("    12\t"), so code read through a tool can be copied
+struct common_speculative_impl_copy : public common_speculative_impl {
+    common_params_speculative_copy params;
+
+    const llama_vocab * vocab = nullptr;
+
+    static constexpr size_t W        = 12;  // chars per indexed window
+    static constexpr int    N_CAND   = 64;  // most recent windows checked per lookup
+    static constexpr size_t L_MAX    = 512; // longest measured match, in chars
+    static constexpr size_t N_CHARS  = 8;   // chars of copied text per draft token
+
+    struct seq_state {
+        llama_tokens          toks;    // context tokens converted to text
+        std::vector<uint32_t> raw_end; // end of each token in raw
+
+        std::string raw;          // text of toks
+        size_t      raw_done = 0; // raw text before this offset is in src
+
+        std::string src; // complete lines of raw, without line number prefixes
+        std::vector<std::pair<uint32_t, uint32_t>> lines; // (raw end, src end) of each line in src
+
+        std::unordered_map<uint64_t, std::vector<uint32_t>> win; // window hash -> window end offsets in src
+        size_t n_win = 0;
+    };
+
+    std::vector<seq_state> states;
+
+    struct run_state {
+        bool   in_run  = false; // the last copy draft was accepted in full
+        size_t n_draft = 0;     // size of the last copy draft
+    };
+
+    std::vector<run_state> runs;
+
+    // the first copy draft of a run has the size of a usual draft, so the verify batch keeps its shape (CUDA graph,
+    // rollback graphs); only a fully accepted copy continues with n_max tokens
+    static constexpr int32_t N_FIRST = 7;
+
+    common_speculative_impl_copy(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_COPY, n_seq, params.copy.n_max)
+        , params(params.copy)
+    {
+        if (params.draft.ctx_tgt == nullptr) {
+            throw std::runtime_error("copy drafting needs the target context");
+        }
+        vocab = llama_model_get_vocab(llama_get_model(params.draft.ctx_tgt));
+
+        SPC_TRC("%s", "adding speculative implementation 'copy'\n");
+        SPC_TRC("- n_max=%d, min_match=%d\n", this->params.n_max, this->params.min_match);
+
+        states.resize(n_seq);
+        runs.resize(n_seq);
+    }
+
+    static uint64_t hash_win(const char * p) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (size_t i = 0; i < W; ++i) {
+            h = (h ^ (uint8_t) p[i]) * 0x100000001b3ULL;
+        }
+        return h;
+    }
+
+    // move the complete lines of raw into src and index them
+    static void add_lines(seq_state & s) {
+        size_t nl;
+        while ((nl = s.raw.find('\n', s.raw_done)) != std::string::npos) {
+            // skip a line number prefix: spaces, digits, then a tab or an arrow
+            size_t i = s.raw_done;
+            while (i < nl && s.raw[i] == ' ') {
+                i++;
+            }
+            size_t j = i;
+            while (j < nl && s.raw[j] >= '0' && s.raw[j] <= '9') {
+                j++;
+            }
+            size_t beg = s.raw_done;
+            if (j > i && s.raw[j] == '\t') {
+                beg = j + 1;
+            } else if (j > i && s.raw.compare(j, 3, "\xE2\x86\x92") == 0) {
+                beg = j + 3;
+            }
+
+            const size_t n_old = s.src.size();
+            s.src.append(s.raw, beg, nl + 1 - beg);
+            for (size_t e = std::max(W, n_old + 1); e <= s.src.size(); ++e) {
+                s.win[hash_win(s.src.data() + e - W)].push_back((uint32_t) e);
+                s.n_win++;
+            }
+
+            s.raw_done = nl + 1;
+            s.lines.emplace_back((uint32_t) s.raw_done, (uint32_t) s.src.size());
+        }
+    }
+
+    // bring the text in line with the context tokens, keeping the common prefix
+    void sync(seq_state & s, const llama_tokens & prompt) {
+        size_t n_keep = 0;
+        while (n_keep < s.toks.size() && n_keep < prompt.size() && s.toks[n_keep] == prompt[n_keep]) {
+            n_keep++;
+        }
+
+        // stale windows are skipped at lookup, but rebuild when they pile up
+        if (n_keep < s.toks.size() && s.n_win > 2*s.src.size() + 65536) {
+            n_keep = 0;
+            s = seq_state();
+        }
+
+        if (n_keep < s.toks.size()) {
+            s.toks.resize(n_keep);
+            s.raw_end.resize(n_keep);
+            s.raw.resize(n_keep > 0 ? s.raw_end.back() : 0);
+            while (!s.lines.empty() && s.lines.back().first > s.raw.size()) {
+                s.lines.pop_back();
+            }
+            s.raw_done = s.lines.empty() ? 0 : s.lines.back().first;
+            s.src.resize(s.lines.empty() ? 0 : s.lines.back().second);
+        }
+
+        for (size_t i = n_keep; i < prompt.size(); ++i) {
+            s.raw += common_token_to_piece(vocab, prompt[i], true);
+            s.raw_end.push_back((uint32_t) s.raw.size());
+            s.toks.push_back(prompt[i]);
+        }
+
+        add_lines(s);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            sync(states[seq_id], prompt);
+        }
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft_one(seq_state & s, run_state & r, common_speculative_draft_params & dp) {
+        sync(s, *dp.prompt);
+
+        const std::string last = common_token_to_piece(vocab, dp.id_last, true);
+        const std::string tail = s.raw.substr(s.raw.size() - std::min(s.raw.size(), L_MAX)) + last;
+        if (tail.size() < W) {
+            return;
+        }
+
+        const auto it = s.win.find(hash_win(tail.data() + tail.size() - W));
+        if (it == s.win.end()) {
+            return;
+        }
+
+        // longest match of the tail, the most recent one on ties
+        size_t best_len = 0;
+        size_t best_end = 0;
+        int n_checked = 0;
+        const auto & ends = it->second;
+        for (size_t k = ends.size(); k-- > 0 && n_checked < N_CAND; ) {
+            const size_t e = ends[k];
+            if (e >= s.src.size()) {
+                continue;
+            }
+            n_checked++;
+            if (memcmp(s.src.data() + e - W, tail.data() + tail.size() - W, W) != 0) {
+                continue;
+            }
+            size_t len = W;
+            while (len < tail.size() && len < e && s.src[e - len - 1] == tail[tail.size() - len - 1]) {
+                len++;
+            }
+            if (len > best_len) {
+                best_len = len;
+                best_end = e;
+            }
+        }
+
+        if (best_len < (size_t) params.min_match) {
+            return;
+        }
+
+        int32_t n_max = r.in_run ? params.n_max : std::min(params.n_max, N_FIRST);
+        if (dp.n_max > 0) {
+            n_max = std::min(n_max, dp.n_max);
+        }
+        const size_t  n_cpy = std::min(s.src.size() - best_end, N_CHARS*n_max);
+
+        // tokenize together with the last token: the draft must start where that token ends
+        llama_tokens toks = common_tokenize(vocab, last + s.src.substr(best_end, n_cpy), false, true);
+        if (best_end + n_cpy < s.src.size() && !toks.empty()) {
+            toks.pop_back(); // the cut can split the last token
+        }
+        if (toks.size() < 2 || toks[0] != dp.id_last) {
+            return;
+        }
+
+        dp.result->assign(toks.begin() + 1, toks.begin() + std::min<size_t>(toks.size(), 1 + n_max));
+        r.n_draft = dp.result->size();
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (dp.drafting) {
+                draft_one(states[seq_id], runs[seq_id], dp);
+            }
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        auto & r = runs[seq_id];
+        r.in_run = !is_other && n_accepted == r.n_draft;
+    }
+};
+
 struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_params_speculative_ngram_cache params;
 
@@ -2362,6 +2578,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_COPY:          return "copy";
         default:                                    return "unknown";
     }
 }
@@ -2464,6 +2681,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_COPY:
+                n_max = std::max(n_max, std::max(0, spec->copy.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2743,7 +2963,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2752,6 +2972,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_COPY);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
@@ -2820,6 +3041,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
                 impls.push_back(
                         std::make_unique<common_speculative_impl_ngram_mod>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_COPY: {
+                impls.push_back(std::make_unique<common_speculative_impl_copy>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {

@@ -4332,6 +4332,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-copy-n-max"}, "N",
+        string_format("maximum number of tokens of a copy draft (default: %d)", params.speculative.copy.n_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 256) {
+                throw std::invalid_argument("copy n-max must be between 1 and 256 inclusive");
+            }
+            params.speculative.copy.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-copy-min-match"}, "N",
+        string_format("minimum length in characters of the matched context text for a copy draft (default: %d)", params.speculative.copy.min_match),
+        [](common_params & params, int value) {
+            if (value < 12 || value > 512) {
+                throw std::invalid_argument("copy min-match must be between 12 and 512 inclusive");
+            }
+            params.speculative.copy.min_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
