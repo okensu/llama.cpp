@@ -729,3 +729,64 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// x = a + b (written to res), dst = rms_norm(x) * mul, mul broadcast over rows. Same arithmetic as the ADD kernel
+// followed by rms_norm_f32<block_size, true>.
+template <int block_size>
+static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, float * res, float * dst, const float * mul,
+                                            const int ncols, const float eps) {
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    a   += row*ncols;
+    b   += row*ncols;
+    res += row*ncols;
+    dst += row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = a[col] + b[col];
+        res[col] = xi;
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * res[col] * mul[col]; // res may alias a (in-place add)
+    }
+}
+
+bool ggml_cuda_should_fuse_add_rms_norm_mul(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    return add->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        rms_norm->src[0] == add && (mul->src[0] == rms_norm || mul->src[1] == rms_norm) &&
+        ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) &&
+        ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]) && ggml_is_contiguous(add) &&
+        ggml_is_contiguous(rms_norm) && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, add) &&
+        ggml_is_contiguous(w) && w->ne[0] == add->ne[0] && ggml_nrows(w) == 1;
+}
+
+void ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int     ncols = add->ne[0];
+    const int64_t nrows = ggml_nrows(add);
+    cudaStream_t stream = ctx.stream();
+
+    // same block size choice as rms_norm_mul_f32_cuda, so the reduction order matches
+    if (ncols < 1024) {
+        add_rms_norm_mul_f32<256><<<nrows, 256, 32*sizeof(float), stream>>>((const float *) add->src[0]->data,
+            (const float *) add->src[1]->data, (float *) add->data, (float *) mul->data, (const float *) w->data, ncols, eps);
+    } else {
+        add_rms_norm_mul_f32<1024><<<nrows, 1024, 32*sizeof(float), stream>>>((const float *) add->src[0]->data,
+            (const float *) add->src[1]->data, (float *) add->data, (float *) mul->data, (const float *) w->data, ncols, eps);
+    }
+}

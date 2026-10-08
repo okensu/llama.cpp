@@ -3605,6 +3605,14 @@ static int ggml_cuda_try_cpy_batch(ggml_backend_cuda_context * cuda_ctx, const g
     return last - i;
 }
 
+static bool add_rms_norm_fusion_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_ADD_RMS_NORM");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3619,6 +3627,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
+    }
+
+    // residual add -> rms_norm -> mul: one kernel (the add result stays a graph value)
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && add_rms_norm_fusion_enabled() &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
+            ggml_cuda_should_fuse_add_rms_norm_mul(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     // gate + up matmuls of a few columns and swiglu: one tensor core kernel
