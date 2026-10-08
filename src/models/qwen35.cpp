@@ -378,6 +378,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         ggml_tensor * ba = ggml_mul_mat(ctx0, ba_w, cur);
         cb(ba, "beta_alpha", il);
 
+        // keep the three projections of the same input next to each other, so the backend can run them as one kernel
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+        ggml_build_forward_expand(gf, ba);
+
         beta = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
                 ggml_element_size(ba), ba->nb[1], ba->nb[1]*n_seq_tokens, 0);
         alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,

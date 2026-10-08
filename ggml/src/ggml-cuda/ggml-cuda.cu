@@ -3638,6 +3638,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // consecutive mul_mats of a few columns with the same src1: one tensor core kernel
+    if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const ggml_tensor * mm[3] = { node, nullptr, nullptr };
+        int n    = 1;
+        int last = i;
+        for (int j = i + 1; j < cgraph->n_nodes && n < 3; ++j) {
+            const ggml_tensor * nj = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(nj)) {
+                continue;
+            }
+            if (nj->op != GGML_OP_MUL_MAT || nj->src[1] != node->src[1] || !(nj->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                break;
+            }
+            mm[n++] = nj;
+            last    = j;
+        }
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (n == 3 && !ggml_cuda_should_use_mmvt_multi(mm, n, cc)) {
+            // e.g. attention q, k (Q5_K) and v (Q6_K): fuse the first two
+            n = 2;
+            for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+                if (cgraph->nodes[j] == mm[1]) {
+                    last = j;
+                    break;
+                }
+            }
+        }
+        if (n >= 2 && ggml_cuda_should_use_mmvt_multi(mm, n, cc)) {
+            // the outputs must not overlap each other or the inputs
+            bool ok = true;
+            const auto src1_span = ggml_cuda_byte_span(node->src[1]);
+            for (int a = 0; a < n && ok; ++a) {
+                const auto da = ggml_cuda_byte_span(mm[a]);
+                ok = !(da.first < src1_span.second && src1_span.first < da.second);
+                for (int b = 0; b < a && ok; ++b) {
+                    const auto db = ggml_cuda_byte_span(mm[b]);
+                    ok = !(da.first < db.second && db.first < da.second);
+                }
+            }
+            if (ok) {
+                ggml_cuda_mul_mat_vec_t_multi(*cuda_ctx, mm, n);
+                return last - i;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {

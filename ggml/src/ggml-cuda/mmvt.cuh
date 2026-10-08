@@ -9,3 +9,8 @@ void ggml_cuda_mul_mat_vec_t(ggml_backend_cuda_context & ctx, const ggml_tensor 
 bool ggml_cuda_should_use_mmvt_glu(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu, int cc);
 
 void ggml_cuda_mul_mat_vec_t_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, ggml_tensor * glu);
+
+// 2..3 mul_mat nodes with the same src1 (e.g. qkv, z, beta/alpha of a Gated DeltaNet layer): one kernel
+bool ggml_cuda_should_use_mmvt_multi(const ggml_tensor * const * mm, int n, int cc);
+
+void ggml_cuda_mul_mat_vec_t_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const * mm, int n);
