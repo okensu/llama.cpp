@@ -1,4 +1,5 @@
 #include "mmvt.cuh"
+#include "vecdotq.cuh"
 
 // Matrix-vector product for 2..8 columns with int8 tensor cores (mma.m16n8k32).
 // The activations get the same q8_1 quantization as MMVQ, but are stored in mma fragment order: for each 32-value
@@ -15,7 +16,7 @@
 static __global__ void mmvt_quantize(
         const float * __restrict__ x, int8_t * __restrict__ yq, float * __restrict__ yd, const int64_t s11, const int ncols) {
     const int ib   = blockIdx.x; // 32-value sub-block
-    const int col  = blockIdx.y;
+    const int col  = threadIdx.y;
     const int lane = threadIdx.x;
 
     const float xi = col < ncols ? x[col*s11 + ib*QK8_1 + lane] : 0.0f;
@@ -79,7 +80,9 @@ static __device__ __forceinline__ void mmvt_scale_min_k4(const uint8_t * q, cons
 template <ggml_type type> struct mmvt_row;
 
 template <> struct mmvt_row<GGML_TYPE_Q5_K> {
-    static constexpr int bs = sizeof(block_q5_K);
+    static constexpr int  bs      = sizeof(block_q5_K);
+    static constexpr bool has_min = true;
+    static constexpr bool paired  = true; // lane t holds values 8t..8t+7
     int4 h;  // dm + scales
     int2 qh;
     __device__ __forceinline__ void load(const char * p, const int t) {
@@ -99,7 +102,9 @@ template <> struct mmvt_row<GGML_TYPE_Q5_K> {
 };
 
 template <> struct mmvt_row<GGML_TYPE_Q4_K> {
-    static constexpr int bs = sizeof(block_q4_K);
+    static constexpr int  bs      = sizeof(block_q4_K);
+    static constexpr bool has_min = true;
+    static constexpr bool paired  = true;
     int4 h;  // dm + scales
     __device__ __forceinline__ void load(const char * p, const int t) {
         GGML_UNUSED(t);
@@ -114,6 +119,30 @@ template <> struct mmvt_row<GGML_TYPE_Q4_K> {
     }
     __device__ __forceinline__ float2 dm() const {
         return __half22float2(*(const half2 *) &h.x);
+    }
+};
+
+
+template <> struct mmvt_row<GGML_TYPE_IQ4_XS> {
+    static constexpr int  bs      = sizeof(block_iq4_xs);
+    static constexpr bool has_min = false;
+    static constexpr bool paired  = false; // lane t holds values 4t..4t+3 and 16+4t..16+4t+3
+    int2 h; // d, scales_h, scales_l
+    __device__ __forceinline__ void load(const char * p, const int t) {
+        GGML_UNUSED(t);
+        h = *(const int2 *) p;
+    }
+    __device__ __forceinline__ void dec(const char * p, const int t, const int s, int & lo, int & hi, int & sc, int & m) const {
+        const int2 v = get_int_from_table_16(*(const int *) (p + 8 + 16*s + 4*t), kvalues_iq4nl);
+        lo = v.x;
+        hi = v.y;
+        const uint32_t scales_h = (uint32_t) h.x >> 16;
+        const uint32_t scales_l = (uint32_t) h.y;
+        sc = (int) (((scales_l >> (4*s)) & 0xF) | (((scales_h >> (2*s)) & 3) << 4)) - 32;
+        m  = 0;
+    }
+    __device__ __forceinline__ float2 dm() const {
+        return make_float2(__half2float(*(const half *) &h.x), 0.0f);
     }
 };
 
@@ -207,7 +236,13 @@ static __global__ void mul_mat_vec_t(
 #pragma unroll
             for (int s = 0; s < QK_K/QK8_1; ++s) {
                 // lane (g, t): B = bytes 8t..8t+7 of column g, A = values 8t..8t+7 of rows g and g + 8
-                const int2   b  = sq[s*WARP_SIZE + lane];
+                int2 b;
+                if constexpr (mmvt_row<type>::paired) {
+                    b = sq[s*WARP_SIZE + lane];
+                } else {
+                    const int * bc = (const int *) (sq + s*WARP_SIZE + 4*g);
+                    b = make_int2(bc[t], bc[t + 4]);
+                }
                 const float2 d8 = *(const float2 *) (sd + s*MMVT_NCOLS + 2*t);
 
                 int a0, a1, a2, a3, sca, ma, scb, mb;
@@ -215,14 +250,20 @@ static __global__ void mul_mat_vec_t(
                 rb.dec(xb, t, s, a1, a3, scb, mb);
 
                 int ci[4] = {0, 0, 0, 0};
-                int cu[4] = {0, 0, 0, 0};
                 mmvt_mma(ci, a0, a1, a2, a3, b.x, b.y);
-                mmvt_mma(cu, 0x01010101, 0x01010101, 0x01010101, 0x01010101, b.x, b.y); // column sums for the min term
+                sum_d[0] += d8.x * (float) (ci[0] * sca);
+                sum_d[1] += d8.y * (float) (ci[1] * sca);
+                sum_d[2] += d8.x * (float) (ci[2] * scb);
+                sum_d[3] += d8.y * (float) (ci[3] * scb);
 
-                sum_d[0] += d8.x * (float) (ci[0] * sca); sum_m[0] += d8.x * (float) (cu[0] * ma);
-                sum_d[1] += d8.y * (float) (ci[1] * sca); sum_m[1] += d8.y * (float) (cu[1] * ma);
-                sum_d[2] += d8.x * (float) (ci[2] * scb); sum_m[2] += d8.x * (float) (cu[2] * mb);
-                sum_d[3] += d8.y * (float) (ci[3] * scb); sum_m[3] += d8.y * (float) (cu[3] * mb);
+                if constexpr (mmvt_row<type>::has_min) {
+                    int cu[4] = {0, 0, 0, 0};
+                    mmvt_mma(cu, 0x01010101, 0x01010101, 0x01010101, 0x01010101, b.x, b.y); // column sums for the min term
+                    sum_m[0] += d8.x * (float) (cu[0] * ma);
+                    sum_m[1] += d8.y * (float) (cu[1] * ma);
+                    sum_m[2] += d8.x * (float) (cu[2] * mb);
+                    sum_m[3] += d8.y * (float) (cu[3] * mb);
+                }
             }
             const float2 dma = ra.dm();
             const float2 dmb = rb.dm();
@@ -276,7 +317,10 @@ bool ggml_cuda_should_use_mmvt(const ggml_tensor * src0, const ggml_tensor * src
     if (!enabled || !GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return false;
     }
-    return (src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    const bool type_ok = src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K ||
+        // 136-byte blocks: stages of MMVT_NWARPS superblocks are 16-byte aligned only for full stages
+        (src0->type == GGML_TYPE_IQ4_XS && (src0->ne[0]/QK_K) % MMVT_NWARPS == 0);
+    return type_ok && (uintptr_t) src0->data % 16 == 0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src1->ne[1] >= 2 && src1->ne[1] <= MMVT_NCOLS &&
         ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_contiguous(src0) &&
         src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) && src0->ne[1] >= 16;
@@ -319,7 +363,7 @@ void ggml_cuda_mul_mat_vec_t(ggml_backend_cuda_context & ctx, const ggml_tensor 
     ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), (size_t) nsub*MMVT_NCOLS*QK8_1);
     ggml_cuda_pool_alloc<float>  yd(ctx.pool(), (size_t) nsub*MMVT_NCOLS);
 
-    mmvt_quantize<<<dim3(nsub, MMVT_NCOLS), WARP_SIZE, 0, stream>>>(
+    mmvt_quantize<<<nsub, dim3(WARP_SIZE, MMVT_NCOLS), 0, stream>>>(
         (const float *) src1->data, yq.get(), yd.get(), src1->nb[1] / sizeof(float), ncols);
 
     const char *  x              = (const char *) src0->data;
@@ -333,6 +377,9 @@ void ggml_cuda_mul_mat_vec_t(ggml_backend_cuda_context & ctx, const ggml_tensor 
             break;
         case GGML_TYPE_Q4_K:
             mul_mat_vec_t_cuda<GGML_TYPE_Q4_K>(x, yq.get(), yd.get(), dst_d, ncols_x, nrows, stride_row_x, ncols, stride_col_dst, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            mul_mat_vec_t_cuda<GGML_TYPE_IQ4_XS>(x, yq.get(), yd.get(), dst_d, ncols_x, nrows, stride_row_x, ncols, stride_col_dst, stream);
             break;
         default:
             GGML_ABORT("unsupported type");
