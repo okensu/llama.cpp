@@ -3621,6 +3621,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // gate + up matmuls of a few columns and swiglu: one tensor core kernel
+    // (gate and up may have different types, so ggml_cuda_can_fuse does not apply)
+    if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty() && i + 2 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {
+        ggml_tensor * glu  = cgraph->nodes[i + 2];
+        ggml_tensor * gate = glu->src[0];
+        ggml_tensor * up   = glu->src[1];
+        const bool pair = up && ((gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) ||
+                                 (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]));
+        int out_nodes[] = { i + 2 };
+        if (pair && ggml_cuda_should_use_mmvt_glu(gate, up, glu, ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+            ggml_cuda_mul_mat_vec_t_glu(*cuda_ctx, gate, up, glu);
+            return 2;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {

@@ -1,4 +1,5 @@
 #include "mmvt.cuh"
+#include "unary.cuh"
 #include "vecdotq.cuh"
 
 // Matrix-vector product for 2..8 columns with int8 tensor cores (mma.m16n8k32).
@@ -146,17 +147,74 @@ template <> struct mmvt_row<GGML_TYPE_IQ4_XS> {
     }
 };
 
-template <ggml_type type, int nwarps, int nstages>
+// Partial sums of one superblock (warp w of the stage) for rows g and g + 8 of the tile, columns 2t and 2t + 1.
+template <ggml_type type>
+static __device__ __forceinline__ void mmvt_superblock(
+        const char * xa, const char * xb, const int2 * sq, const float * sd, const int g, const int t, const int lane, float (&acc)[4]) {
+    mmvt_row<type> ra;
+    mmvt_row<type> rb;
+    ra.load(xa, t);
+    rb.load(xb, t);
+
+    float sum_d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int s = 0; s < QK_K/QK8_1; ++s) {
+        // lane (g, t): B = 8 bytes of column g, A = the same 8 values of rows g and g + 8
+        int2 b;
+        if constexpr (mmvt_row<type>::paired) {
+            b = sq[s*WARP_SIZE + lane];
+        } else {
+            const int * bc = (const int *) (sq + s*WARP_SIZE + 4*g);
+            b = make_int2(bc[t], bc[t + 4]);
+        }
+        const float2 d8 = *(const float2 *) (sd + s*MMVT_NCOLS + 2*t);
+
+        int a0, a1, a2, a3, sca, ma, scb, mb;
+        ra.dec(xa, t, s, a0, a2, sca, ma);
+        rb.dec(xb, t, s, a1, a3, scb, mb);
+
+        int ci[4] = {0, 0, 0, 0};
+        mmvt_mma(ci, a0, a1, a2, a3, b.x, b.y);
+        sum_d[0] += d8.x * (float) (ci[0] * sca);
+        sum_d[1] += d8.y * (float) (ci[1] * sca);
+        sum_d[2] += d8.x * (float) (ci[2] * scb);
+        sum_d[3] += d8.y * (float) (ci[3] * scb);
+
+        if constexpr (mmvt_row<type>::has_min) {
+            int cu[4] = {0, 0, 0, 0};
+            mmvt_mma(cu, 0x01010101, 0x01010101, 0x01010101, 0x01010101, b.x, b.y); // column sums for the min term
+            sum_m[0] += d8.x * (float) (cu[0] * ma);
+            sum_m[1] += d8.y * (float) (cu[1] * ma);
+            sum_m[2] += d8.x * (float) (cu[2] * mb);
+            sum_m[3] += d8.y * (float) (cu[3] * mb);
+        }
+    }
+    const float2 dma = ra.dm();
+    const float2 dmb = rb.dm();
+    acc[0] += dma.x*sum_d[0] - dma.y*sum_m[0];
+    acc[1] += dma.x*sum_d[1] - dma.y*sum_m[1];
+    acc[2] += dmb.x*sum_d[2] - dmb.y*sum_m[2];
+    acc[3] += dmb.x*sum_d[3] - dmb.y*sum_m[3];
+}
+
+// glu == false: dst = x0 * y. glu == true: dst = silu(x0 * y) * (x1 * y) with x0 = gate, x1 = up (same shape);
+// each tile then streams the gate superblocks first and the up superblocks second.
+template <ggml_type type0, ggml_type type1, bool glu, int nwarps, int nstages>
 __launch_bounds__(nwarps*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_t(
-        const char * __restrict__ x, const int8_t * __restrict__ yq, const float * __restrict__ yd, float * __restrict__ dst,
-        const int ncols_x, const int nrows, const int64_t stride_row_x, const int ncols_dst, const int64_t stride_col_dst) {
-    constexpr int bs     = mmvt_row<type>::bs;
-    constexpr int row_sz = nwarps*bs + 16;                          // padded row of one stage in shared memory
+        const char * __restrict__ x0, const char * __restrict__ x1, const int8_t * __restrict__ yq, const float * __restrict__ yd,
+        float * __restrict__ dst, const int ncols_x, const int nrows, const int64_t stride_row_x0, const int64_t stride_row_x1,
+        const int ncols_dst, const int64_t stride_col_dst) {
+    constexpr int bs0    = mmvt_row<type0>::bs;
+    constexpr int bs1    = mmvt_row<type1>::bs;
+    constexpr int bs_max = bs0 > bs1 ? bs0 : bs1;
+    constexpr int row_sz = nwarps*bs_max + 16;                      // padded row of one stage in shared memory
     constexpr int x_sz   = 16*row_sz;
     constexpr int yq_sz  = nwarps*(QK_K/QK8_1)*MMVT_NCOLS*QK8_1;
     constexpr int yd_sz  = nwarps*(QK_K/QK8_1)*MMVT_NCOLS*sizeof(float);
     constexpr int st_sz  = x_sz + yq_sz + yd_sz;
+    constexpr int nparts = glu ? 2 : 1;
 
     extern __shared__ __align__(16) char smem[];
     float * red = (float *) (smem + nstages*st_sz);
@@ -169,17 +227,23 @@ static __global__ void mul_mat_vec_t(
 
     const int nsb      = ncols_x / QK_K;
     const int nst      = (nsb + nwarps - 1) / nwarps;
+    const int nst_tile = nparts*nst;
     const int ntiles   = (nrows + 15) / 16;
     const int my_tiles = ntiles > (int) blockIdx.x ? (ntiles - 1 - blockIdx.x) / gridDim.x + 1 : 0;
-    const int nq       = my_tiles * nst;
+    const int nq       = my_tiles * nst_tile;
 
     auto load_stage = [&](const int q) {
-        const int tile = blockIdx.x + (q / nst) * gridDim.x;
-        const int kb0  = (q % nst) * nwarps;
-        const int nh   = min(nwarps, nsb - kb0);
+        const int  tile = blockIdx.x + (q / nst_tile) * gridDim.x;
+        const int  qt   = q % nst_tile;
+        const bool p1   = glu && qt >= nst;
+        const int  kb0  = (qt - (p1 ? nst : 0)) * nwarps;
+        const int  nh   = min(nwarps, nsb - kb0);
+        const int  bs   = p1 ? bs1 : bs0;
+        const char *  x            = p1 ? x1 : x0;
+        const int64_t stride_row_x = p1 ? stride_row_x1 : stride_row_x0;
         char * buf = smem + (q % nstages) * st_sz;
 
-        constexpr int cpr = nwarps*bs/16;
+        const int cpr      = nwarps*bs/16;
         const int cpr_here = nh*bs/16;
         for (int c = tid; c < 16*cpr; c += nwarps*WARP_SIZE) {
             const int r = c / cpr;
@@ -207,7 +271,8 @@ static __global__ void mul_mat_vec_t(
         mmvt_commit();
     }
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int q = 0; q < nq; ++q) {
         mmvt_wait<nstages - 2>();
@@ -217,68 +282,29 @@ static __global__ void mul_mat_vec_t(
         }
         mmvt_commit();
 
-        const int st = q % nst;
-        const int kb = st*nwarps + w;
+        const int  qt = q % nst_tile;
+        const bool p1 = glu && qt >= nst;
+        const int  kb = (qt - (p1 ? nst : 0))*nwarps + w;
         if (kb < nsb) {
-            const char * buf = smem + (q % nstages) * st_sz;
-            const char * xa  = buf + w*bs + g*row_sz;       // row g
-            const char * xb  = buf + w*bs + (g + 8)*row_sz; // row g + 8
-            const int2  * sq = (const int2  *) (buf + x_sz) + w*(QK_K/QK8_1)*WARP_SIZE;
-            const float * sd = (const float *) (buf + x_sz + yq_sz) + w*(QK_K/QK8_1)*MMVT_NCOLS;
-
-            mmvt_row<type> ra;
-            mmvt_row<type> rb;
-            ra.load(xa, t);
-            rb.load(xb, t);
-
-            float sum_d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            float sum_m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-            for (int s = 0; s < QK_K/QK8_1; ++s) {
-                // lane (g, t): B = bytes 8t..8t+7 of column g, A = values 8t..8t+7 of rows g and g + 8
-                int2 b;
-                if constexpr (mmvt_row<type>::paired) {
-                    b = sq[s*WARP_SIZE + lane];
-                } else {
-                    const int * bc = (const int *) (sq + s*WARP_SIZE + 4*g);
-                    b = make_int2(bc[t], bc[t + 4]);
-                }
-                const float2 d8 = *(const float2 *) (sd + s*MMVT_NCOLS + 2*t);
-
-                int a0, a1, a2, a3, sca, ma, scb, mb;
-                ra.dec(xa, t, s, a0, a2, sca, ma);
-                rb.dec(xb, t, s, a1, a3, scb, mb);
-
-                int ci[4] = {0, 0, 0, 0};
-                mmvt_mma(ci, a0, a1, a2, a3, b.x, b.y);
-                sum_d[0] += d8.x * (float) (ci[0] * sca);
-                sum_d[1] += d8.y * (float) (ci[1] * sca);
-                sum_d[2] += d8.x * (float) (ci[2] * scb);
-                sum_d[3] += d8.y * (float) (ci[3] * scb);
-
-                if constexpr (mmvt_row<type>::has_min) {
-                    int cu[4] = {0, 0, 0, 0};
-                    mmvt_mma(cu, 0x01010101, 0x01010101, 0x01010101, 0x01010101, b.x, b.y); // column sums for the min term
-                    sum_m[0] += d8.x * (float) (cu[0] * ma);
-                    sum_m[1] += d8.y * (float) (cu[1] * ma);
-                    sum_m[2] += d8.x * (float) (cu[2] * mb);
-                    sum_m[3] += d8.y * (float) (cu[3] * mb);
-                }
+            const char  * buf = smem + (q % nstages) * st_sz;
+            const int2  * sq  = (const int2  *) (buf + x_sz) + w*(QK_K/QK8_1)*WARP_SIZE;
+            const float * sd  = (const float *) (buf + x_sz + yq_sz) + w*(QK_K/QK8_1)*MMVT_NCOLS;
+            if (p1) {
+                mmvt_superblock<type1>(buf + w*bs1 + g*row_sz, buf + w*bs1 + (g + 8)*row_sz, sq, sd, g, t, lane, acc1);
+            } else {
+                mmvt_superblock<type0>(buf + w*bs0 + g*row_sz, buf + w*bs0 + (g + 8)*row_sz, sq, sd, g, t, lane, acc0);
             }
-            const float2 dma = ra.dm();
-            const float2 dmb = rb.dm();
-            acc[0] += dma.x*sum_d[0] - dma.y*sum_m[0];
-            acc[1] += dma.x*sum_d[1] - dma.y*sum_m[1];
-            acc[2] += dmb.x*sum_d[2] - dmb.y*sum_m[2];
-            acc[3] += dmb.x*sum_d[3] - dmb.y*sum_m[3];
         }
 
-        if (st == nst - 1) {
+        if (qt == nst_tile - 1) {
             // tile done: add the partial sums of the warps in fixed order and write the 16 rows
-            const int row0 = 16*(blockIdx.x + (q / nst) * gridDim.x);
+            const int row0 = 16*(blockIdx.x + (q / nst_tile) * gridDim.x);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                red[(w*4 + i)*WARP_SIZE + lane] = acc[i];
+                red[(w*8 + i)*WARP_SIZE + lane] = acc0[i];
+                if constexpr (glu) {
+                    red[(w*8 + 4 + i)*WARP_SIZE + lane] = acc1[i];
+                }
             }
             __syncthreads();
             if (w == 0) {
@@ -286,27 +312,47 @@ static __global__ void mul_mat_vec_t(
                 for (int i = 0; i < 4; ++i) {
 #pragma unroll
                     for (int v = 1; v < nwarps; ++v) {
-                        acc[i] += red[(v*4 + i)*WARP_SIZE + lane];
+                        acc0[i] += red[(v*8 + i)*WARP_SIZE + lane];
+                        if constexpr (glu) {
+                            acc1[i] += red[(v*8 + 4 + i)*WARP_SIZE + lane];
+                        }
+                    }
+                    if constexpr (glu) {
+                        acc0[i] = ggml_cuda_op_silu_single(acc0[i]) * acc1[i];
                     }
                 }
                 const int c0 = 2*t;
                 const int c1 = 2*t + 1;
                 if (row0 + g < nrows) {
-                    if (c0 < ncols_dst) dst[c0*stride_col_dst + row0 + g] = acc[0];
-                    if (c1 < ncols_dst) dst[c1*stride_col_dst + row0 + g] = acc[1];
+                    if (c0 < ncols_dst) dst[c0*stride_col_dst + row0 + g] = acc0[0];
+                    if (c1 < ncols_dst) dst[c1*stride_col_dst + row0 + g] = acc0[1];
                 }
                 if (row0 + g + 8 < nrows) {
-                    if (c0 < ncols_dst) dst[c0*stride_col_dst + row0 + g + 8] = acc[2];
-                    if (c1 < ncols_dst) dst[c1*stride_col_dst + row0 + g + 8] = acc[3];
+                    if (c0 < ncols_dst) dst[c0*stride_col_dst + row0 + g + 8] = acc0[2];
+                    if (c1 < ncols_dst) dst[c1*stride_col_dst + row0 + g + 8] = acc0[3];
                 }
             }
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                acc[i] = 0.0f;
+                acc0[i] = 0.0f;
+                acc1[i] = 0.0f;
             }
         }
     }
     mmvt_wait<0>();
+}
+
+static bool ggml_cuda_mmvt_type_ok(const ggml_tensor * w) {
+    switch (w->type) {
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q4_K:
+            return true;
+        case GGML_TYPE_IQ4_XS:
+            // 136-byte blocks: stages of MMVT_NWARPS superblocks are 16-byte aligned only for full stages
+            return (w->ne[0]/QK_K) % MMVT_NWARPS == 0;
+        default:
+            return false;
+    }
 }
 
 bool ggml_cuda_should_use_mmvt(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
@@ -317,71 +363,131 @@ bool ggml_cuda_should_use_mmvt(const ggml_tensor * src0, const ggml_tensor * src
     if (!enabled || !GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return false;
     }
-    const bool type_ok = src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K ||
-        // 136-byte blocks: stages of MMVT_NWARPS superblocks are 16-byte aligned only for full stages
-        (src0->type == GGML_TYPE_IQ4_XS && (src0->ne[0]/QK_K) % MMVT_NWARPS == 0);
-    return type_ok && (uintptr_t) src0->data % 16 == 0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    return ggml_cuda_mmvt_type_ok(src0) && (uintptr_t) src0->data % 16 == 0 &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src1->ne[1] >= 2 && src1->ne[1] <= MMVT_NCOLS &&
         ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_contiguous(src0) &&
         src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) && src0->ne[1] >= 16;
 }
 
-template <ggml_type type>
+bool ggml_cuda_should_use_mmvt_glu(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu, int cc) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVT_GLU");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+    const ggml_tensor * w0 = gate->src[0];
+    const ggml_tensor * w1 = up->src[0];
+    const bool pair_ok = (w0->type == GGML_TYPE_IQ4_XS && w1->type == GGML_TYPE_Q5_K) || (w0->type == w1->type);
+    return pair_ok && gate->src[1] == up->src[1] && ggml_are_same_shape(w0, w1) &&
+        ggml_cuda_should_use_mmvt(w0, gate->src[1], gate, cc) && ggml_cuda_should_use_mmvt(w1, up->src[1], up, cc) &&
+        glu->type == GGML_TYPE_F32 && glu->nb[0] == sizeof(float) && ggml_is_matrix(glu) &&
+        ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
+        glu->src[0] == gate && glu->src[1] == up;
+}
+
+template <ggml_type type0, ggml_type type1, bool glu>
 static void mul_mat_vec_t_cuda(
-        const char * x, const int8_t * yq, const float * yd, float * dst, const int ncols_x, const int nrows,
-        const int64_t stride_row_x, const int ncols_dst, const int64_t stride_col_dst, cudaStream_t stream) {
+        const char * x0, const char * x1, const int8_t * yq, const float * yd, float * dst, const int ncols_x, const int nrows,
+        const int64_t stride_row_x0, const int64_t stride_row_x1, const int ncols_dst, const int64_t stride_col_dst, cudaStream_t stream) {
     constexpr int nwarps  = MMVT_NWARPS;
     constexpr int nstages = MMVT_NSTAGES;
-    constexpr size_t st_sz = 16*(nwarps*mmvt_row<type>::bs + 16) + nwarps*(QK_K/QK8_1)*MMVT_NCOLS*(QK8_1 + sizeof(float));
-    const size_t smem = nstages*st_sz + nwarps*4*WARP_SIZE*sizeof(float);
+    constexpr size_t bs_max = mmvt_row<type0>::bs > mmvt_row<type1>::bs ? mmvt_row<type0>::bs : mmvt_row<type1>::bs;
+    constexpr size_t st_sz  = 16*(nwarps*bs_max + 16) + nwarps*(QK_K/QK8_1)*MMVT_NCOLS*(QK8_1 + sizeof(float));
+    const size_t smem = nstages*st_sz + nwarps*8*WARP_SIZE*sizeof(float);
 
     const int id = ggml_cuda_get_device();
     static bool smem_set[GGML_CUDA_MAX_DEVICES] = {false};
     if (!smem_set[id]) {
-        CUDA_CHECK(cudaFuncSetAttribute(mul_mat_vec_t<type, nwarps, nstages>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        CUDA_CHECK(cudaFuncSetAttribute(mul_mat_vec_t<type0, type1, glu, nwarps, nstages>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         smem_set[id] = true;
     }
 
     const int ntiles  = (nrows + 15) / 16;
     const int nblocks = std::min(ntiles, 2*ggml_cuda_info().devices[id].nsm);
 
-    mul_mat_vec_t<type, nwarps, nstages><<<nblocks, dim3(WARP_SIZE, nwarps), smem, stream>>>(
-        x, yq, yd, dst, ncols_x, nrows, stride_row_x, ncols_dst, stride_col_dst);
+    mul_mat_vec_t<type0, type1, glu, nwarps, nstages><<<nblocks, dim3(WARP_SIZE, nwarps), smem, stream>>>(
+        x0, x1, yq, yd, dst, ncols_x, nrows, stride_row_x0, stride_row_x1, ncols_dst, stride_col_dst);
     CUDA_CHECK(cudaGetLastError());
+}
+
+static void mmvt_quantize_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+        ggml_cuda_pool_alloc<int8_t> & yq, ggml_cuda_pool_alloc<float> & yd) {
+    const int nsub = src1->ne[0] / QK8_1;
+    yq.alloc(ctx.pool(), (size_t) nsub*MMVT_NCOLS*QK8_1);
+    yd.alloc(ctx.pool(), (size_t) nsub*MMVT_NCOLS);
+    mmvt_quantize<<<nsub, dim3(WARP_SIZE, MMVT_NCOLS), 0, ctx.stream()>>>(
+        (const float *) src1->data, yq.get(), yd.get(), src1->nb[1] / sizeof(float), src1->ne[1]);
 }
 
 void ggml_cuda_mul_mat_vec_t(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->ne[0] % QK_K == 0);
 
-    cudaStream_t stream = ctx.stream();
-
-    const int ncols_x = src0->ne[0];
-    const int nrows   = src0->ne[1];
-    const int ncols   = src1->ne[1];
-    const int nsub    = ncols_x / QK8_1;
-
-    ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), (size_t) nsub*MMVT_NCOLS*QK8_1);
-    ggml_cuda_pool_alloc<float>  yd(ctx.pool(), (size_t) nsub*MMVT_NCOLS);
-
-    mmvt_quantize<<<nsub, dim3(WARP_SIZE, MMVT_NCOLS), 0, stream>>>(
-        (const float *) src1->data, yq.get(), yd.get(), src1->nb[1] / sizeof(float), ncols);
+    ggml_cuda_pool_alloc<int8_t> yq;
+    ggml_cuda_pool_alloc<float>  yd;
+    mmvt_quantize_cuda(ctx, src1, yq, yd);
 
     const char *  x              = (const char *) src0->data;
     float *       dst_d          = (float *) dst->data;
+    const int     ncols_x        = src0->ne[0];
+    const int     nrows          = src0->ne[1];
+    const int     ncols          = src1->ne[1];
     const int64_t stride_row_x   = src0->nb[1] / ggml_type_size(src0->type);
     const int64_t stride_col_dst = dst->nb[1] / sizeof(float);
+    cudaStream_t  stream         = ctx.stream();
 
     switch (src0->type) {
         case GGML_TYPE_Q5_K:
-            mul_mat_vec_t_cuda<GGML_TYPE_Q5_K>(x, yq.get(), yd.get(), dst_d, ncols_x, nrows, stride_row_x, ncols, stride_col_dst, stream);
+            mul_mat_vec_t_cuda<GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, false>(x, x, yq.get(), yd.get(), dst_d, ncols_x, nrows,
+                stride_row_x, stride_row_x, ncols, stride_col_dst, stream);
             break;
         case GGML_TYPE_Q4_K:
-            mul_mat_vec_t_cuda<GGML_TYPE_Q4_K>(x, yq.get(), yd.get(), dst_d, ncols_x, nrows, stride_row_x, ncols, stride_col_dst, stream);
+            mul_mat_vec_t_cuda<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, false>(x, x, yq.get(), yd.get(), dst_d, ncols_x, nrows,
+                stride_row_x, stride_row_x, ncols, stride_col_dst, stream);
             break;
         case GGML_TYPE_IQ4_XS:
-            mul_mat_vec_t_cuda<GGML_TYPE_IQ4_XS>(x, yq.get(), yd.get(), dst_d, ncols_x, nrows, stride_row_x, ncols, stride_col_dst, stream);
+            mul_mat_vec_t_cuda<GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, false>(x, x, yq.get(), yd.get(), dst_d, ncols_x, nrows,
+                stride_row_x, stride_row_x, ncols, stride_col_dst, stream);
             break;
         default:
             GGML_ABORT("unsupported type");
     }
+}
+
+void ggml_cuda_mul_mat_vec_t_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up, ggml_tensor * glu) {
+    const ggml_tensor * w0   = gate->src[0];
+    const ggml_tensor * w1   = up->src[0];
+    const ggml_tensor * src1 = gate->src[1];
+    GGML_ASSERT(w0->ne[0] % QK_K == 0);
+
+    ggml_cuda_pool_alloc<int8_t> yq;
+    ggml_cuda_pool_alloc<float>  yd;
+    mmvt_quantize_cuda(ctx, src1, yq, yd);
+
+    const char *  x0             = (const char *) w0->data;
+    const char *  x1             = (const char *) w1->data;
+    float *       dst_d          = (float *) glu->data;
+    const int     ncols_x        = w0->ne[0];
+    const int     nrows          = w0->ne[1];
+    const int     ncols          = src1->ne[1];
+    const int64_t stride_row_x0  = w0->nb[1] / ggml_type_size(w0->type);
+    const int64_t stride_row_x1  = w1->nb[1] / ggml_type_size(w1->type);
+    const int64_t stride_col_dst = glu->nb[1] / sizeof(float);
+    cudaStream_t  stream         = ctx.stream();
+
+#define MMVT_GLU_CASE(t0, t1)                                                                                         \
+    if (w0->type == t0 && w1->type == t1) {                                                                            \
+        mul_mat_vec_t_cuda<t0, t1, true>(x0, x1, yq.get(), yd.get(), dst_d, ncols_x, nrows, stride_row_x0, stride_row_x1, \
+            ncols, stride_col_dst, stream);                                                                            \
+        return;                                                                                                        \
+    }
+    MMVT_GLU_CASE(GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K)
+    MMVT_GLU_CASE(GGML_TYPE_Q5_K,   GGML_TYPE_Q5_K)
+    MMVT_GLU_CASE(GGML_TYPE_Q4_K,   GGML_TYPE_Q4_K)
+    MMVT_GLU_CASE(GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS)
+#undef MMVT_GLU_CASE
+    GGML_ABORT("unsupported type pair");
 }
