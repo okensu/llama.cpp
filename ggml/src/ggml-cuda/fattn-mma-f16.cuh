@@ -2137,7 +2137,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 // Must agree between ggml_cuda_flash_attn_ext_get_alloc_size (f16 scratch) and ggml_cuda_flash_attn_ext_mma_f16_case.
 // Only used for small batches (speculative-decoding verification): every Q tile streams the whole KV cache, so for large
 // batches converting the cache once is cheaper than dequantizing it in every tile.
-// Disable with GGML_CUDA_FA_Q8_DIRECT=0, set the max. batch size with GGML_CUDA_FA_Q8_DIRECT_MAX_BATCH (default 8).
+// Disable with GGML_CUDA_FA_Q8_DIRECT=0, set the max. batch size with GGML_CUDA_FA_Q8_DIRECT_MAX_BATCH (default 64).
 static bool ggml_cuda_flash_attn_ext_mma_kv_q8_direct(const ggml_tensor * dst) {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_FA_Q8_DIRECT");
@@ -2145,7 +2145,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kv_q8_direct(const ggml_tensor * dst) {
     }();
     static const int max_batch = [] {
         const char * e = getenv("GGML_CUDA_FA_Q8_DIRECT_MAX_BATCH");
-        return e ? atoi(e) : 8;
+        return e ? atoi(e) : 64;
     }();
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
