@@ -2659,6 +2659,9 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // hint for a gated_delta_net result: only slot 0 and slot K-1 are read, backends may skip the other snapshots
+    GGML_API void ggml_gated_delta_net_set_ends_only(struct ggml_tensor * a, bool ends_only);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

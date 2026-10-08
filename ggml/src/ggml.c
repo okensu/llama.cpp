@@ -6427,6 +6427,11 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+void ggml_gated_delta_net_set_ends_only(struct ggml_tensor * a, bool ends_only) {
+    GGML_ASSERT(a->op == GGML_OP_GATED_DELTA_NET);
+    ggml_set_op_params_i32(a, 1, ends_only ? 1 : 0);
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
