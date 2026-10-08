@@ -2680,7 +2680,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // graphs of different batch sizes can start with the same node: keep one CUDA graph per shape,
+    // so that alternating batch sizes (speculative verify of 8 and 32 tokens) do not recapture each time
+    uintptr_t key = (uintptr_t) cgraph->nodes[0];
+    key ^= (uintptr_t) cgraph->n_nodes * (uintptr_t) 0x9E3779B97F4A7C15ull;
+    key ^= (uintptr_t) cgraph->nodes[0]->ne[1] * (uintptr_t) 0xC2B2AE3D27D4EB4Full;
+    key ^= (uintptr_t) cgraph->nodes[cgraph->n_nodes - 1]->ne[1] * (uintptr_t) 0x165667B19E3779F9ull;
+    return (const void *) key;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
