@@ -4,7 +4,7 @@
 
 #include <climits>
 
-// Matrix-vector product for 2..8 columns with int8 tensor cores (mma.m16n8k32).
+// Matrix-vector product for 2..32 columns with int8 tensor cores (mma.m16n8k32), in groups of 8 columns.
 // The activations get the same q8_1 quantization as MMVQ, but are stored in mma fragment order: for each 32-value
 // sub-block, 8 columns x 32 bytes, plus one float scale per column. One mma gives the exact integer dot product of
 // 16 rows x 8 columns for one sub-block; the float scaling is done once per sub-block (MMVQ: once per 8 values),
@@ -13,7 +13,7 @@
 // superblocks of K and their sums are added in a fixed order, so the results are deterministic.
 
 #define MMVT_NCOLS   8   // columns per mma (one column group)
-#define MMVT_MAX_NCG 2   // up to 2 column groups: 16 columns
+#define MMVT_MAX_NCG 4   // up to 4 column groups: 32 columns
 #define MMVT_NWARPS  4
 #define MMVT_NSTAGES 2
 
@@ -252,6 +252,8 @@ static __global__ void mul_mat_vec_t(const __grid_constant__ mmvt_args args, con
     constexpr int yd_sz  = nwarps*(QK_K/QK8_1)*nc*sizeof(float);
     constexpr int st_sz  = x_sz + yq_sz + yd_sz;
     constexpr int nparts = glu ? 2 : 1;
+    // more than 16 columns: the partial sums reuse the stage just processed, to stay within the shared memory limit
+    constexpr bool red_in_stage = ncg > 2;
 
     extern __shared__ __align__(16) char smem[];
     float * red = (float *) (smem + nstages*st_sz);
@@ -354,6 +356,10 @@ static __global__ void mul_mat_vec_t(const __grid_constant__ mmvt_args args, con
         if (q % nst_tile == nst_tile - 1) {
             // tile done: add the partial sums of the warps in fixed order and write the 16 rows
             constexpr int nacc = 4*ncg;
+            if constexpr (red_in_stage) {
+                __syncthreads();
+                red = (float *) (smem + (q % nstages) * st_sz);
+            }
 #pragma unroll
             for (int i = 0; i < nacc; ++i) {
                 red[(w*2*nacc + i)*WARP_SIZE + lane] = acc0[i];
@@ -402,13 +408,18 @@ static __global__ void mul_mat_vec_t(const __grid_constant__ mmvt_args args, con
     mmvt_wait<0>();
 }
 
-// GGML_CUDA_MMVT_MAX_NCOLS=8 restricts the kernel to 8 columns
+// GGML_CUDA_MMVT_MAX_NCOLS=N restricts the kernel to N columns (rounded up to a multiple of 8)
 static int mmvt_max_ncg() {
     static const int ncg = [] {
         const char * env = getenv("GGML_CUDA_MMVT_MAX_NCOLS");
-        return env != nullptr && atoi(env) <= MMVT_NCOLS ? 1 : MMVT_MAX_NCG;
+        return env != nullptr ? std::max(1, std::min(MMVT_MAX_NCG, (atoi(env) + MMVT_NCOLS - 1) / MMVT_NCOLS)) : MMVT_MAX_NCG;
     }();
     return ncg;
+}
+
+// column groups of 8 columns for ncols columns
+static int mmvt_ncg(const int64_t ncols) {
+    return (int) std::min<int64_t>(MMVT_MAX_NCG, (ncols + MMVT_NCOLS - 1) / MMVT_NCOLS);
 }
 
 static bool ggml_cuda_mmvt_type_ok(const ggml_tensor * w) {
@@ -484,7 +495,8 @@ static void mul_mat_vec_t_launch(const mmvt_args & args, const int8_t * yq, cons
     constexpr size_t bs_01  = mmvt_row<type0>::bs > mmvt_row<type1>::bs ? mmvt_row<type0>::bs : mmvt_row<type1>::bs;
     constexpr size_t bs_max = bs_01 > mmvt_row<type2>::bs ? bs_01 : mmvt_row<type2>::bs;
     constexpr size_t st_sz  = 16*(nwarps*bs_max + 16) + nwarps*(QK_K/QK8_1)*MMVT_NCOLS*ncg*(QK8_1 + sizeof(float));
-    const size_t smem = nstages*st_sz + nwarps*8*ncg*WARP_SIZE*sizeof(float);
+    const size_t smem = nstages*st_sz + (ncg > 2 ? 0 : nwarps*8*ncg*WARP_SIZE*sizeof(float));
+    static_assert(nwarps*8*ncg*WARP_SIZE*sizeof(float) <= st_sz, "partial sums must fit in one stage");
 
     const int id = ggml_cuda_get_device();
     static bool smem_set[GGML_CUDA_MAX_DEVICES] = {false};
@@ -502,10 +514,11 @@ static void mul_mat_vec_t_launch(const mmvt_args & args, const int8_t * yq, cons
 
 template <ggml_type type0, ggml_type type1, ggml_type type2, bool glu>
 static void mul_mat_vec_t_cuda(const mmvt_args & args, const int8_t * yq, const float * yd, cudaStream_t stream) {
-    if (args.ncols_dst <= MMVT_NCOLS) {
-        mul_mat_vec_t_launch<type0, type1, type2, glu, 1>(args, yq, yd, stream);
-    } else {
-        mul_mat_vec_t_launch<type0, type1, type2, glu, 2>(args, yq, yd, stream);
+    switch (mmvt_ncg(args.ncols_dst)) {
+        case 1:  mul_mat_vec_t_launch<type0, type1, type2, glu, 1>(args, yq, yd, stream); break;
+        case 2:  mul_mat_vec_t_launch<type0, type1, type2, glu, 2>(args, yq, yd, stream); break;
+        case 3:  mul_mat_vec_t_launch<type0, type1, type2, glu, 3>(args, yq, yd, stream); break;
+        default: mul_mat_vec_t_launch<type0, type1, type2, glu, 4>(args, yq, yd, stream); break;
     }
 }
 
@@ -513,15 +526,17 @@ static void mmvt_quantize_cuda(ggml_backend_cuda_context & ctx, const ggml_tenso
         ggml_cuda_pool_alloc<int8_t> & yq, ggml_cuda_pool_alloc<float> & yd) {
     const int nsub = src1->ne[0] / QK8_1;
     // same column group count as mul_mat_vec_t_cuda
-    const int nc = src1->ne[1] <= MMVT_NCOLS ? MMVT_NCOLS : MMVT_NCOLS*MMVT_MAX_NCG;
+    const int ncg = mmvt_ncg(src1->ne[1]);
+    const int nc  = MMVT_NCOLS*ncg;
     yq.alloc(ctx.pool(), (size_t) nsub*nc*QK8_1);
     yd.alloc(ctx.pool(), (size_t) nsub*nc);
-    if (nc == MMVT_NCOLS) {
-        mmvt_quantize<MMVT_NCOLS><<<nsub, dim3(WARP_SIZE, MMVT_NCOLS), 0, ctx.stream()>>>(
-            (const float *) src1->data, yq.get(), yd.get(), src1->nb[1] / sizeof(float), src1->ne[1]);
-    } else {
-        mmvt_quantize<MMVT_NCOLS*MMVT_MAX_NCG><<<nsub, dim3(WARP_SIZE, MMVT_NCOLS*MMVT_MAX_NCG), 0, ctx.stream()>>>(
-            (const float *) src1->data, yq.get(), yd.get(), src1->nb[1] / sizeof(float), src1->ne[1]);
+    const float * x   = (const float *) src1->data;
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    switch (ncg) {
+        case 1:  mmvt_quantize<1*MMVT_NCOLS><<<nsub, dim3(WARP_SIZE, 1*MMVT_NCOLS), 0, ctx.stream()>>>(x, yq.get(), yd.get(), s11, src1->ne[1]); break;
+        case 2:  mmvt_quantize<2*MMVT_NCOLS><<<nsub, dim3(WARP_SIZE, 2*MMVT_NCOLS), 0, ctx.stream()>>>(x, yq.get(), yd.get(), s11, src1->ne[1]); break;
+        case 3:  mmvt_quantize<3*MMVT_NCOLS><<<nsub, dim3(WARP_SIZE, 3*MMVT_NCOLS), 0, ctx.stream()>>>(x, yq.get(), yd.get(), s11, src1->ne[1]); break;
+        default: mmvt_quantize<4*MMVT_NCOLS><<<nsub, dim3(WARP_SIZE, 4*MMVT_NCOLS), 0, ctx.stream()>>>(x, yq.get(), yd.get(), s11, src1->ne[1]); break;
     }
 }
 
