@@ -770,8 +770,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    // [TAG_FATTN_KV_CHUNK] prompt batches of the MMA kernel convert a long cache in chunks
+    const int64_t kv_chunk = kernel == BEST_FATTN_KERNEL_MMA_F16 ? ggml_cuda_fattn_kv_chunk_rows(dst, need_f16_K, need_f16_V) : 0;
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, kv_chunk);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }
