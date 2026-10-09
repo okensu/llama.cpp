@@ -56,6 +56,15 @@ static __device__ __forceinline__ void mmvt_cp16(void * dst, const void * src) {
 #endif // defined(CP_ASYNC_AVAILABLE)
 }
 
+static __device__ __forceinline__ void mmvt_cp8(void * dst, const void * src) {
+#if defined(CP_ASYNC_AVAILABLE)
+    const unsigned dst_s = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" :: "r"(dst_s), "l"(src));
+#else
+    *(int2 *) dst = *(const int2 *) src;
+#endif // defined(CP_ASYNC_AVAILABLE)
+}
+
 static __device__ __forceinline__ void mmvt_commit() {
 #if defined(CP_ASYNC_AVAILABLE)
     asm volatile("cp.async.commit_group;");
@@ -151,12 +160,94 @@ template <> struct mmvt_row<GGML_TYPE_IQ4_XS> {
     }
 };
 
+// 210-byte blocks: a superblock in shared memory is only 2-byte aligned, loads are 16 bit wide.
+// Each 32-value sub-block has two scales (16 values each), so the superblock routine has its own path for this type.
+template <> struct mmvt_row<GGML_TYPE_Q6_K> {
+    static constexpr int  bs      = sizeof(block_q6_K);
+    static constexpr bool has_min = false;
+    static constexpr bool paired  = true;
+};
+
+// 8 bytes at a 2-byte aligned address
+static __device__ __forceinline__ int2 mmvt_ld8_a2(const char * p) {
+    const uint16_t * h = (const uint16_t *) p;
+    return make_int2((int) (h[0] | ((uint32_t) h[1] << 16)), (int) (h[2] | ((uint32_t) h[3] << 16)));
+}
+
+// int8 values 8t..8t+7 of sub-block s of a q6_K superblock (minus 32), as two ints
+static __device__ __forceinline__ void mmvt_dec_q6_K(const char * p, const int t, const int s, int & lo, int & hi) {
+    const int ip = s >> 2;
+    const int j  = s & 3;
+    const int2 ql = mmvt_ld8_a2(p + 64*ip + 32*(j & 1) + 8*t);
+    const int2 qh = mmvt_ld8_a2(p + 128 + 32*ip + 8*t);
+    const int sl = 4*(j >> 1);
+    const int sh = 2*j;
+    lo = ((ql.x >> sl) & 0x0F0F0F0F) | (((qh.x >> sh) & 0x03030303) << 4);
+    hi = ((ql.y >> sl) & 0x0F0F0F0F) | (((qh.y >> sh) & 0x03030303) << 4);
+    lo = __vsubss4(lo, 0x20202020);
+    hi = __vsubss4(hi, 0x20202020);
+}
+
+template <int ncg>
+static __device__ __forceinline__ void mmvt_superblock_q6_K(
+        const char * xa, const char * xb, const int2 * sq, const float * sd, const int t, const int lane, float (&acc)[4*ncg]) {
+    float sum_d[4*ncg];
+#pragma unroll
+    for (int i = 0; i < 4*ncg; ++i) {
+        sum_d[i] = 0.0f;
+    }
+    // lanes t = 0, 1 hold values 0..15 of a sub-block (first scale), lanes t = 2, 3 values 16..31 (second scale):
+    // one mma per half, with the A values of the other half set to zero
+    const bool first = t < 2;
+#pragma unroll
+    for (int s = 0; s < QK_K/QK8_1; ++s) {
+        int a0, a1, a2, a3;
+        mmvt_dec_q6_K(xa, t, s, a0, a2);
+        mmvt_dec_q6_K(xb, t, s, a1, a3);
+        const int is  = 8*(s >> 2) + 2*(s & 3);
+        const int sa0 = ((const int8_t *) xa)[192 + is];
+        const int sa1 = ((const int8_t *) xa)[192 + is + 1];
+        const int sb0 = ((const int8_t *) xb)[192 + is];
+        const int sb1 = ((const int8_t *) xb)[192 + is + 1];
+        const int f0 = first ? a0 : 0, f1 = first ? a1 : 0, f2 = first ? a2 : 0, f3 = first ? a3 : 0;
+        const int g0 = first ? 0 : a0, g1 = first ? 0 : a1, g2 = first ? 0 : a2, g3 = first ? 0 : a3;
+
+#pragma unroll
+        for (int cg = 0; cg < ncg; ++cg) {
+            const int2   b  = sq[(s*ncg + cg)*WARP_SIZE + lane];
+            const float2 d8 = *(const float2 *) (sd + s*MMVT_NCOLS*ncg + 8*cg + 2*t);
+
+            int c0[4] = {0, 0, 0, 0};
+            int c1[4] = {0, 0, 0, 0};
+            mmvt_mma(c0, f0, f1, f2, f3, b.x, b.y);
+            mmvt_mma(c1, g0, g1, g2, g3, b.x, b.y);
+            sum_d[4*cg + 0] += d8.x * (float) (c0[0]*sa0 + c1[0]*sa1);
+            sum_d[4*cg + 1] += d8.y * (float) (c0[1]*sa0 + c1[1]*sa1);
+            sum_d[4*cg + 2] += d8.x * (float) (c0[2]*sb0 + c1[2]*sb1);
+            sum_d[4*cg + 3] += d8.y * (float) (c0[3]*sb0 + c1[3]*sb1);
+        }
+    }
+    const float da = __half2float(*(const half *) (xa + 208));
+    const float db = __half2float(*(const half *) (xb + 208));
+#pragma unroll
+    for (int cg = 0; cg < ncg; ++cg) {
+        acc[4*cg + 0] += da*sum_d[4*cg + 0];
+        acc[4*cg + 1] += da*sum_d[4*cg + 1];
+        acc[4*cg + 2] += db*sum_d[4*cg + 2];
+        acc[4*cg + 3] += db*sum_d[4*cg + 3];
+    }
+}
+
 // Partial sums of one superblock (warp w of the stage) for rows g and g + 8 of the tile and, per group of 8 columns
 // cg, columns 8 cg + 2t and 8 cg + 2t + 1. The weights are decoded once for all column groups.
 template <ggml_type type, int ncg>
 static __device__ __forceinline__ void mmvt_superblock(
         const char * xa, const char * xb, const int2 * sq, const float * sd, const int g, const int t, const int lane,
         float (&acc)[4*ncg]) {
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        GGML_UNUSED(g);
+        mmvt_superblock_q6_K<ncg>(xa, xb, sq, sd, t, lane, acc);
+    } else {
     mmvt_row<type> ra;
     mmvt_row<type> rb;
     ra.load(xa, t);
@@ -214,6 +305,7 @@ static __device__ __forceinline__ void mmvt_superblock(
         acc[4*cg + 2] += dmb.x*sum_d[4*cg + 2] - dmb.y*sum_m[4*cg + 2];
         acc[4*cg + 3] += dmb.x*sum_d[4*cg + 3] - dmb.y*sum_m[4*cg + 3];
     }
+    }
 }
 
 #define MMVT_MAX_MATS 3
@@ -254,6 +346,7 @@ static __global__ void mul_mat_vec_t(const __grid_constant__ mmvt_args args, con
     constexpr int nparts = glu ? 2 : 1;
     // more than 16 columns: the partial sums reuse the stage just processed, to stay within the shared memory limit
     constexpr bool red_in_stage = ncg > 2;
+    constexpr int  ch = (nwarps*bs0) % 16 == 0 && (nwarps*bs1) % 16 == 0 && (nwarps*bs2) % 16 == 0 ? 16 : 8;
 
     extern __shared__ __align__(16) char smem[];
     float * red = (float *) (smem + nstages*st_sz);
@@ -293,14 +386,19 @@ static __global__ void mul_mat_vec_t(const __grid_constant__ mmvt_args args, con
         const int nh = min(nwarps, nsb - kb0);
         char * buf = smem + (q % nstages) * st_sz;
 
-        const int cpr      = nwarps*bs/16;
-        const int cpr_here = nh*bs/16;
+        // 16-byte copies, 8-byte copies for blocks whose stages are not 16-byte aligned (q6_K)
+        const int cpr      = nwarps*bs/ch;
+        const int cpr_here = nh*bs/ch;
         for (int c = tid; c < 16*cpr; c += nwarps*WARP_SIZE) {
             const int r = c / cpr;
             const int o = c - r*cpr;
             if (o < cpr_here) {
                 const int row = min(16*tile + r, m.nrows - 1);
-                mmvt_cp16(buf + r*row_sz + 16*o, m.x + (row*m.stride_row_x + kb0)*bs + 16*o);
+                if constexpr (ch == 16) {
+                    mmvt_cp16(buf + r*row_sz + 16*o, m.x + (row*m.stride_row_x + kb0)*bs + 16*o);
+                } else {
+                    mmvt_cp8(buf + r*row_sz + 8*o, m.x + (row*m.stride_row_x + kb0)*bs + 8*o);
+                }
             }
         }
         const char * yq_src = (const char *) yq + (size_t) kb0*(QK_K/QK8_1)*nc*QK8_1;
@@ -422,6 +520,14 @@ static int mmvt_ncg(const int64_t ncols) {
     return (int) std::min<int64_t>(MMVT_MAX_NCG, (ncols + MMVT_NCOLS - 1) / MMVT_NCOLS);
 }
 
+static bool mmvt_q6_K_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVT_Q6K");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_mmvt_type_ok(const ggml_tensor * w) {
     switch (w->type) {
         case GGML_TYPE_Q5_K:
@@ -430,6 +536,9 @@ static bool ggml_cuda_mmvt_type_ok(const ggml_tensor * w) {
         case GGML_TYPE_IQ4_XS:
             // 136-byte blocks: stages of MMVT_NWARPS superblocks are 16-byte aligned only for full stages
             return (w->ne[0]/QK_K) % MMVT_NWARPS == 0;
+        case GGML_TYPE_Q6_K:
+            // 210-byte blocks: rows and stages of MMVT_NWARPS superblocks are 8-byte aligned if a row has 4k superblocks
+            return mmvt_q6_K_enabled() && (w->ne[0]/QK_K) % 4 == 0 && MMVT_NWARPS % 4 == 0;
         default:
             return false;
     }
@@ -447,7 +556,9 @@ bool ggml_cuda_should_use_mmvt(const ggml_tensor * src0, const ggml_tensor * src
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src1->ne[1] >= 2 && src1->ne[1] <= MMVT_NCOLS*mmvt_max_ncg() &&
         ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_contiguous(src0) &&
-        src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) && src0->ne[1] >= 16;
+        src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) && src0->ne[1] >= 16 &&
+        // q6_K: MMVQ is as fast up to 8 columns, mmvt replaces MMQ above
+        (src0->type != GGML_TYPE_Q6_K || src1->ne[1] > 8);
 }
 
 bool ggml_cuda_should_use_mmvt_glu(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu, int cc) {
@@ -588,6 +699,9 @@ void ggml_cuda_mul_mat_vec_t(ggml_backend_cuda_context & ctx, const ggml_tensor 
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_t_cuda<GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, false>(args, yq.get(), yd.get(), stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_vec_t_cuda<GGML_TYPE_Q6_K, GGML_TYPE_Q6_K, GGML_TYPE_Q6_K, false>(args, yq.get(), yd.get(), stream);
             break;
         default:
             GGML_ABORT("unsupported type");
