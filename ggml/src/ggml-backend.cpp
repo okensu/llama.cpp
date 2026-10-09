@@ -1996,7 +1996,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        // with one copy too: before an input copy the scheduler then waits for the previous run of the split, not for
+        // everything queued on the backend since (e.g. a wait on another stream that the next graph must not start before)
+        static const bool events_single = [] {
+            const char * e = getenv("GGML_SCHED_EVENTS");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (sched->n_copies > 1 || events_single) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
