@@ -71,6 +71,11 @@ GGML_API bool ggml_gallocr_reserve_n(
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
+// layouts of earlier graphs: save_plan() keeps the current layout (after a reserve) for the graph, use_plan() makes
+// the saved layout of a graph with the same structure, sizes and buffer ids current again (false if there is none)
+GGML_API void ggml_gallocr_save_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids);
+GGML_API bool ggml_gallocr_use_plan (ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids);
+
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
 // Utils

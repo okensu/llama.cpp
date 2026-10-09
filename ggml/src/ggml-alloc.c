@@ -479,6 +479,20 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+#define GGML_GALLOCR_MAX_PLANS 8
+
+struct gallocr_plan {
+    uint64_t key; // hash of the graph structure, 0 = empty slot
+    uint64_t gen;
+    uint64_t used;
+    int n_nodes;
+    int n_leafs;
+    struct node_alloc * node_allocs;
+    struct leaf_alloc * leaf_allocs;
+    int * node_buffer_ids; // [n_nodes]
+    int * leaf_buffer_ids; // [n_leafs]
+};
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -493,6 +507,11 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // layouts of the graphs allocated before, reused when a graph of the same shape comes again
+    struct gallocr_plan plans[GGML_GALLOCR_MAX_PLANS];
+    uint64_t gen;  // incremented when a buffer is reallocated, which invalidates the plans
+    uint64_t tick;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -576,6 +595,13 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    for (int i = 0; i < GGML_GALLOCR_MAX_PLANS; i++) {
+        struct gallocr_plan * p = &galloc->plans[i];
+        free(p->node_allocs);
+        free(p->leaf_allocs);
+        free(p->node_buffer_ids);
+        free(p->leaf_buffer_ids);
+    }
     free(galloc);
 }
 
@@ -933,6 +959,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->gen++;
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -1055,6 +1082,159 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     }
 
     return false;
+}
+
+static uint64_t ggml_gallocr_graph_key(const struct ggml_cgraph * graph) {
+    uint64_t h = 1469598103934665603ULL;
+#define GALLOCR_MIX(v) do { h ^= (uint64_t) (v); h *= 1099511628211ULL; } while (0)
+    GALLOCR_MIX(graph->n_nodes);
+    GALLOCR_MIX(graph->n_leafs);
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        GALLOCR_MIX(node->op);
+        GALLOCR_MIX(node->type);
+        GALLOCR_MIX(node->flags);
+        GALLOCR_MIX(node->view_src != NULL);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            GALLOCR_MIX(node->ne[d]);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const struct ggml_tensor * src = node->src[j];
+            GALLOCR_MIX(src ? (int) src->op + 1 : 0);
+            if (src) {
+                GALLOCR_MIX(src->ne[0]);
+                GALLOCR_MIX(src->ne[1]);
+            }
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        const struct ggml_tensor * leaf = graph->leafs[i];
+        GALLOCR_MIX(leaf->type);
+        GALLOCR_MIX(leaf->ne[0]);
+        GALLOCR_MIX(leaf->ne[1]);
+    }
+#undef GALLOCR_MIX
+    return h == 0 ? 1 : h;
+}
+
+static bool ggml_gallocr_plans_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GGML_GALLOC_PLANS");
+        enabled = e == NULL || atoi(e) != 0;
+    }
+    return enabled;
+}
+
+static bool ggml_gallocr_ids_equal(const int * a, const int * b, int n) {
+    for (int i = 0; i < n; i++) {
+        if ((a ? a[i] : 0) != (b ? b[i] : 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_gallocr_use_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    if (!ggml_gallocr_plans_enabled()) {
+        return false;
+    }
+    const uint64_t key = ggml_gallocr_graph_key(graph);
+    for (int k = 0; k < GGML_GALLOCR_MAX_PLANS; k++) {
+        struct gallocr_plan * p = &galloc->plans[k];
+        if (p->key != key || p->gen != galloc->gen || p->n_nodes != graph->n_nodes || p->n_leafs != graph->n_leafs ||
+            !ggml_gallocr_ids_equal(p->node_buffer_ids, node_buffer_ids, graph->n_nodes) ||
+            !ggml_gallocr_ids_equal(p->leaf_buffer_ids, leaf_buffer_ids, graph->n_leafs)) {
+            continue;
+        }
+        bool ok = true;
+        for (int i = 0; i < graph->n_nodes && ok; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            ok = ggml_gallocr_node_needs_realloc(galloc, node, &p->node_allocs[i].dst);
+            for (int j = 0; j < GGML_MAX_SRC && ok; j++) {
+                if (node->src[j] != NULL) {
+                    ok = ggml_gallocr_node_needs_realloc(galloc, node->src[j], &p->node_allocs[i].src[j]);
+                }
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        if (galloc->n_nodes < graph->n_nodes) {
+            free(galloc->node_allocs);
+            galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
+            GGML_ASSERT(galloc->node_allocs != NULL);
+        }
+        if (galloc->n_leafs < graph->n_leafs) {
+            free(galloc->leaf_allocs);
+            galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(struct leaf_alloc));
+            GGML_ASSERT(galloc->leaf_allocs != NULL);
+        }
+        memcpy(galloc->node_allocs, p->node_allocs, graph->n_nodes * sizeof(struct node_alloc));
+        memcpy(galloc->leaf_allocs, p->leaf_allocs, graph->n_leafs * sizeof(struct leaf_alloc));
+        galloc->n_nodes = graph->n_nodes;
+        galloc->n_leafs = graph->n_leafs;
+        p->used = ++galloc->tick;
+        return true;
+    }
+    return false;
+}
+
+void ggml_gallocr_save_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    if (!ggml_gallocr_plans_enabled() || galloc->n_nodes != graph->n_nodes || galloc->n_leafs != graph->n_leafs) {
+        return;
+    }
+    const uint64_t key = ggml_gallocr_graph_key(graph);
+    // the slot of the same graph, else an empty or stale one, else the least recently used one
+    struct gallocr_plan * p = NULL;
+    for (int k = 0; k < GGML_GALLOCR_MAX_PLANS && p == NULL; k++) {
+        struct gallocr_plan * q = &galloc->plans[k];
+        if (q->key == key && q->n_nodes == graph->n_nodes && q->n_leafs == graph->n_leafs) {
+            p = q;
+        }
+    }
+    for (int k = 0; k < GGML_GALLOCR_MAX_PLANS && p == NULL; k++) {
+        if (galloc->plans[k].key == 0 || galloc->plans[k].gen != galloc->gen) {
+            p = &galloc->plans[k];
+        }
+    }
+    if (p == NULL) {
+        p = &galloc->plans[0];
+        for (int k = 1; k < GGML_GALLOCR_MAX_PLANS; k++) {
+            if (galloc->plans[k].used < p->used) {
+                p = &galloc->plans[k];
+            }
+        }
+    }
+    const int nn = graph->n_nodes;
+    const int nl = graph->n_leafs;
+    if (p->node_allocs == NULL || p->n_nodes < nn) {
+        free(p->node_allocs);
+        free(p->node_buffer_ids);
+        p->node_allocs     = malloc((nn > 0 ? nn : 1) * sizeof(struct node_alloc));
+        p->node_buffer_ids = malloc((nn > 0 ? nn : 1) * sizeof(int));
+        GGML_ASSERT(p->node_allocs != NULL && p->node_buffer_ids != NULL);
+    }
+    if (p->leaf_allocs == NULL || p->n_leafs < nl) {
+        free(p->leaf_allocs);
+        free(p->leaf_buffer_ids);
+        p->leaf_allocs     = malloc((nl > 0 ? nl : 1) * sizeof(struct leaf_alloc));
+        p->leaf_buffer_ids = malloc((nl > 0 ? nl : 1) * sizeof(int));
+        GGML_ASSERT(p->leaf_allocs != NULL && p->leaf_buffer_ids != NULL);
+    }
+    memcpy(p->node_allocs, galloc->node_allocs, nn * sizeof(struct node_alloc));
+    memcpy(p->leaf_allocs, galloc->leaf_allocs, nl * sizeof(struct leaf_alloc));
+    for (int i = 0; i < nn; i++) {
+        p->node_buffer_ids[i] = node_buffer_ids ? node_buffer_ids[i] : 0;
+    }
+    for (int i = 0; i < nl; i++) {
+        p->leaf_buffer_ids[i] = leaf_buffer_ids ? leaf_buffer_ids[i] : 0;
+    }
+    p->key     = key;
+    p->gen     = galloc->gen;
+    p->n_nodes = nn;
+    p->n_leafs = nl;
+    p->used    = ++galloc->tick;
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {

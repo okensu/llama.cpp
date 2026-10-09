@@ -1789,9 +1789,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
-            return false;
+        // a graph of the same shape was allocated before: take its layout instead of planning a new one
+        const bool cached = ggml_gallocr_use_plan(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!cached) {
+            if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+                GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+                return false;
+            }
+            ggml_gallocr_save_plan(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
