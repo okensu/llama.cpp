@@ -20,6 +20,7 @@
 
 #include "../../src/llama-ext.h" // staging API: llama_memory_tree_accept
 
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -4125,8 +4126,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        bool spec_ok = true;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+            //       for now, always re-evaluate for simplicity
+            //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+            // before the sync: drafters that read the target features on the GPU queue their work behind the decode,
+            // so it runs while the logits are copied and sampled (drafters that read host data synchronize themselves)
+            if (ret == 0 && spec) {
+                spec_ok = common_speculative_process(spec.get(), batch.view);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -4185,16 +4195,8 @@ private:
             metrics_post_decode(off, batch.view.size(), has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
-            });
-
-            if (!ok) {
+            if (!spec_ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error

@@ -128,6 +128,9 @@ struct llama_context {
     void set_inject_from_other(bool value);
     void set_graph_cache(int32_t n);
 
+    // queue the output copies that decode() left pending
+    void flush_output_copies();
+
     // make the next decode/encode of this context wait on the GPU for the work already submitted to other
     void wait_for(llama_context & other);
     void set_nextn_layer_offset(int32_t offset);
@@ -431,6 +434,14 @@ private:
     uint64_t gf_res_tick = 0;
     int      gf_res_n_cache = -1;
     int      gf_res_n_cache_req = 0;
+
+    // logits copy of the last ubatch, queued by flush_output_copies()
+    struct pending_copy {
+        ggml_backend_t backend = nullptr;
+        ggml_tensor *  t       = nullptr;
+        void *         dst     = nullptr;
+        size_t         size    = 0;
+    } pending_logits;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;

@@ -796,11 +796,19 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::flush_output_copies() {
+    if (pending_logits.t != nullptr) {
+        ggml_backend_tensor_get_async(pending_logits.backend, pending_logits.t, pending_logits.dst, 0, pending_logits.size);
+        pending_logits = {};
+    }
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
 
+    flush_output_copies();
     ggml_backend_sched_synchronize(sched.get());
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1522,6 +1530,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // the outputs of the previous ubatch are read before this one can overwrite them (stream order)
+    flush_output_copies();
+
     if (gf_res_n_cache < 0) {
         const char * e = getenv("LLAMA_GRAPH_CACHE");
         gf_res_n_cache = cparams.pipeline_parallel ? 0 : std::min(std::max(e ? atoi(e) : gf_res_n_cache_req, 0), GF_RES_MAX - 2);
@@ -1690,6 +1701,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // GPU waits on other contexts (llama_wait_for) go in right before the graph: queued earlier, the scheduler's
+    // synchronization of a layout change would block the host until the other context's work is done
+    flush_waits();
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1704,6 +1719,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
     flush_waits();
+    flush_output_copies();
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1944,7 +1960,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    flush_waits();
+    flush_output_copies();
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2184,7 +2200,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // the copy is queued at the next synchronize or ubatch, so that host-to-device copies queued
+                // before then (e.g. the inputs of a drafter that runs behind this decode) are not stuck behind it
+                static const bool defer = [] {
+                    const char * e = getenv("LLAMA_DEFER_LOGITS");
+                    return e == nullptr || atoi(e) != 0;
+                }();
+                flush_output_copies();
+                if (defer) {
+                    pending_logits = { backend_res, t_logits, logits_out, (size_t) n_outputs*n_vocab*sizeof(float) };
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
