@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <map>
 #include <queue>
+#include <random>
 #include <unordered_map>
 #include <cinttypes>
 
@@ -998,6 +999,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    // probabilistic DFlash2 drafts: one stream per seq, seeded from the request's seed at its first draft
+    std::vector<std::mt19937> rngs;
+    std::vector<uint8_t>      rng_reseed;
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1101,6 +1106,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch_inject = common_batch(ctx_dft);
 
         tree_batches.resize(n_seq);
+        rngs.resize(n_seq);
+        rng_reseed.assign(n_seq, 1);
 
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
@@ -1321,6 +1328,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // a new request: same seed -> same drafts, whatever ran before
+        rng_reseed[seq_id] = 1;
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1533,10 +1543,63 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     continue;
                 }
 
+                // probabilistic: sample the path from the lattice and hand the verifier the distribution each
+                // token was drawn from, so rejection sampling keeps the target distribution exactly
+                const bool sample = dp.result_q != nullptr && params.probabilistic && dp.temp > 0.0f;
+                if (sample) {
+                    dp.result_q->clear();
+                }
+                if (sample && rng_reseed[seq_id]) {
+                    rng_reseed[seq_id] = 0;
+                    // must be a different stream than the verifier's rejection rng (seed ^ 0x9e3779b9, see
+                    // common/sampling.cpp), or the accept test correlates with the draft and biases the output
+                    std::seed_seq seq{ dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed, 0x64666c32u };
+                    rngs[seq_id].seed(seq);
+                }
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+
+                    if (sample) {
+                        // q = softmax(scores) over the position's candidates; duplicates share their mass
+                        const float m = *std::max_element(scores, scores + selector_top_k);
+                        std::vector<llama_token_data> q;
+                        q.reserve(selector_top_k);
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            const float e = std::exp(scores[k] - m);
+                            sum += e;
+                            q.push_back({ (llama_token) row[k], scores[k], e });
+                        }
+                        float   u    = std::uniform_real_distribution<float>(0.0f, sum)(rngs[seq_id]);
+                        int32_t pick = selector_top_k - 1;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            u -= q[k].p;
+                            if (u < 0.0f) {
+                                pick = k;
+                                break;
+                            }
+                        }
+                        std::vector<llama_token_data> qd;
+                        qd.reserve(selector_top_k);
+                        for (const auto & e : q) {
+                            auto it = std::find_if(qd.begin(), qd.end(), [&](const llama_token_data & d) { return d.id == e.id; });
+                            if (it == qd.end()) {
+                                qd.push_back({ e.id, e.logit, e.p / sum });
+                            } else {
+                                it->p += e.p / sum;
+                            }
+                        }
+                        predecessor = pick;
+                        if (params.p_min > 0.0f && q[pick].p / sum < params.p_min) {
+                            break;
+                        }
+                        result.push_back((llama_token) row[pick]);
+                        dp.result_q->push_back(std::move(qd));
+                        continue;
+                    }
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
@@ -1555,6 +1618,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                    if (dp.result_q) {
+                        dp.result_q->clear();
+                    }
                 }
                 continue;
             }
