@@ -18,6 +18,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_memory_tree_accept
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -74,6 +76,51 @@ static std::vector<llama_token> server_accept_replay(
     const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
     common_sampler_accept(smpl, id, true);
     result.push_back(id);
+
+    return result;
+}
+
+// token tree draft: sample at the root, then follow the child with the sampled token while there is one
+// rows gets the accepted path in the verify batch of the slot (0 = the last sampled token, i + 1 = draft token i)
+static std::vector<llama_token> server_sample_and_accept_tree(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft,
+        const std::vector<int32_t> & parent,
+        std::vector<int32_t> & rows) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && parent.size() == draft.size());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+    std::vector<llama_token> result;
+    rows.assign(1, 0);
+
+    int32_t cur = -1;
+    while (true) {
+        const llama_token id = common_sampler_sample(smpl, ctx, idxs[cur + 1]);
+        common_sampler_accept(smpl, id, true);
+        result.push_back(id);
+
+        // do not accept draft tokens after an EOG
+        if (llama_vocab_is_eog(vocab, id)) {
+            break;
+        }
+
+        // the children of a node come after it
+        int32_t next = -1;
+        for (int32_t i = cur + 1; i < (int32_t) draft.size(); ++i) {
+            if (parent[i] == cur && draft[i] == id) {
+                next = i;
+                break;
+            }
+        }
+        if (next < 0) {
+            break;
+        }
+        cur = next;
+        rows.push_back(cur + 1);
+    }
 
     return result;
 }
@@ -145,6 +192,7 @@ struct server_batch {
         bool is_prompt; // for stats tracking
         int32_t decision_order = 0;
         int32_t i_embd = -1; // row in embd, -1 if this is a token
+        int32_t tree_parent = -2; // batch index of the parent in a token tree, -1 for the root, -2 if not in a tree
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -224,6 +272,11 @@ struct server_batch {
         tokens[idx].decision_order = order;
     }
 
+    void set_tree_parent(int32_t idx, int32_t parent) {
+        GGML_ASSERT(idx >= 0 && idx < (int32_t)tokens.size() && parent >= -1 && parent < idx);
+        tokens[idx].tree_parent = parent;
+    }
+
     // render the sub-batch [off, off + n_tokens) into view, index i in view is index off + i here
     void render(int32_t off, int32_t n_tokens) {
         GGML_ASSERT(off >= 0 && off < size());
@@ -238,6 +291,10 @@ struct server_batch {
                 view.add(t.token, t.pos[0], t.id_slot, t.output);
             }
             view.tokens.back().decision_order = t.decision_order;
+            if (t.tree_parent != -2) {
+                GGML_ASSERT(t.tree_parent < 0 || t.tree_parent >= off);
+                view.set_tree_parent(i - off, t.tree_parent < 0 ? -1 : t.tree_parent - off);
+            }
         }
     }
 };
@@ -258,6 +315,9 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+
+    // token tree draft: parent of each token in spec_draft (-1 = child of the sampled token), empty for a chain
+    std::vector<int32_t> spec_draft_parent;
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
@@ -393,6 +453,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_parent.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -570,9 +631,24 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
-            for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+            if (!spec_draft_parent.empty()) {
+                // token tree: a node is one position after its parent
+                GGML_ASSERT(spec_draft_parent.size() == spec_draft.size());
+                const int32_t i_root = batch.size();
+                add_ok &= batch.add(id, sampled, pos0, true, false);
+                batch.set_tree_parent(i_root, -1);
+                std::vector<llama_pos> pos(spec_draft.size());
+                for (size_t i = 0; i < spec_draft.size(); i++) {
+                    const int32_t p = spec_draft_parent[i];
+                    pos[i] = p < 0 ? pos0 + 1 : pos[p] + 1;
+                    add_ok &= batch.add(this->id, spec_draft[i], pos[i], true, false);
+                    batch.set_tree_parent(batch.size() - 1, p < 0 ? i_root : i_root + 1 + p);
+                }
+            } else {
+                add_ok &= batch.add(id, sampled, pos0++, true, false);
+                for (auto token : spec_draft) {
+                    add_ok &= batch.add(this->id, token, pos0++, true, false);
+                }
             }
         }
 
@@ -3247,6 +3323,11 @@ private:
 
                         const bool spec_reject = slot.use_spec_rejection();
 
+                        // token tree: one slot in the batch, verified by match (a tree draft has no candidate distribution)
+                        const bool spec_tree = params_base.speculative.draft.tree_n > 0 && params_base.n_parallel == 1 &&
+                            common_speculative_get_synth_probs(spec.get()).empty();
+                        slot.spec_draft_parent.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3257,6 +3338,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .result_parent = */ spec_tree ? &slot.spec_draft_parent : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -4295,8 +4377,13 @@ private:
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
+                const bool is_tree = !slot.spec_draft_parent.empty();
+                std::vector<int32_t> tree_rows;
+
                 std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
+                if (is_tree) {
+                    accepted = server_sample_and_accept_tree(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_parent, tree_rows);
+                } else if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
@@ -4350,10 +4437,19 @@ private:
                 }
 
                 if (trace > 0) {
-                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens%s\n", accepted.size() - 1, n_draft, is_tree ? " (tree)" : "");
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                if (is_tree) {
+                    // keep the accepted path of the tree in the target memory
+                    if (!llama_memory_tree_accept(llama_get_memory(slot.ctx_tgt), slot.id, tree_rows.data(), (int32_t) tree_rows.size())) {
+                        GGML_ABORT("failed to accept the token tree path of slot %d\n", slot.id);
+                    }
+                    common_speculative_accept_tree(spec.get(), slot.id, tree_rows);
+                    slot.spec_draft_parent.clear();
+                } else {
+                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                }
 
                 slot.spec_draft = std::move(accepted);
             }

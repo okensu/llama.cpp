@@ -4,7 +4,7 @@
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
-                                    const float * bias_ptr,
+                                    const float * bias_ptr, const int32_t * tree_idx,
                                     const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                     float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
                                     const int64_t n_t) {
@@ -39,6 +39,17 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
 
     for (int64_t i = 0; i < n_t; i++) {
         float sumf = 0.0f;
+
+        if (tree_idx) {
+            // token tree: same sum order as the sliding window
+#pragma unroll
+            for (size_t j = 0; j < d_conv; j++) {
+                sumf += x_block[tid * stride_x + tree_idx[i * d_conv + j]] * w[j];
+            }
+            sumf += b;
+            y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+            continue;
+        }
 
         if (i == 0) {
             for (size_t j = 0; j < d_conv; j++) {
@@ -124,7 +135,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 }
 
 template <bool apply_silu>
-static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
+static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int32_t * tree_idx, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
                               const int64_t n_s, cudaStream_t stream) {
@@ -133,10 +144,10 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
-        if (n_t <= 32) {
+        if (n_t <= 32 || tree_idx) {
             const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
-            ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
+            ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, threads, kNC>, launch_params, src0, src1, bias, tree_idx, src0_nb0, src0_nb1,
                                                                         src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
         } else {
             const int64_t split_n_t = 32;
@@ -185,6 +196,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
     const float * bias_d = fuse_bias ? (const float *) bias->data : nullptr;
+    const int32_t * tree_idx_d = dst->src[2] ? (const int32_t *) dst->src[2]->data : nullptr;
     float *       dst_d  = (float *) out->data;
     cudaStream_t  stream = ctx.stream();
 
@@ -197,10 +209,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     }
 
     if (fuse_silu) {
-        ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
+        ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, tree_idx_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
     } else {
-        ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
+        ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, tree_idx_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }

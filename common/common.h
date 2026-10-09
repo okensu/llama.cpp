@@ -337,6 +337,9 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    int32_t tree_n   = 0;    // draft a token tree of this many tokens and verify all branches in one batch (0 = one chain)
+    float   tree_rho = 1.25f; // use the tree only if its expected accepted length is this many times that of the greedy chain
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -416,6 +419,11 @@ struct common_params_speculative {
         const bool has_copy = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_COPY) != types.end();
         if (has_copy && rs_recompute != nullptr && atoi(rs_recompute) != 0) {
             n_rs_seq = std::max(n_rs_seq, (uint32_t) copy.n_max);
+        }
+
+        // a token tree batch records the inputs of all its nodes for the rollback recompute
+        if (needs_rs_seq && draft.tree_n > 0 && rs_recompute != nullptr && atoi(rs_recompute) != 0) {
+            n_rs_seq = std::max(n_rs_seq, (uint32_t) draft.tree_n);
         }
 
         return n_rs_seq;
@@ -1089,6 +1097,7 @@ struct common_batch {
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
+        int32_t      tree_parent = -2;   // see llama_batch_ext_set_tree_parent(), -2 = not in a tree
     };
 
     std::vector<token> tokens; // mirror of the entries, tokens[i] describes batch index i
@@ -1120,6 +1129,9 @@ struct common_batch {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
 
     bool set_output(int32_t idx, bool value);
+
+    // token tree: entry idx is a child of entry parent (-1 for the root)
+    bool set_tree_parent(int32_t idx, int32_t parent);
 
     // attach a token embedding to the entry at idx, can only be set once per entry
     bool set_embd(int32_t idx, llama_embd embd);

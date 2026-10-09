@@ -268,6 +268,23 @@ public:
     const llm_arch arch;
 };
 
+// token tree ubatch (see llama_batch_ext_set_tree_parent): conv windows and root-to-leaf paths of the recurrent layers
+class llm_graph_input_tree : public llm_graph_input_i {
+public:
+    llm_graph_input_tree(int64_t d_conv, int64_t n_tokens) : d_conv(d_conv), n_tokens(n_tokens) {}
+    virtual ~llm_graph_input_tree() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * conv_idx = nullptr; // I32 [d_conv, n_tokens], see ggml_ssm_conv_set_tree()
+    ggml_tensor * paths    = nullptr; // I32 [n_tokens, n_tokens], see ggml_gated_delta_net_set_tree()
+
+    const int64_t d_conv;
+    const int64_t n_tokens;
+};
+
 class llm_graph_input_rs : public llm_graph_input_i {
 public:
     llm_graph_input_rs(const llama_memory_recurrent_context * mctx) : mctx(mctx) {}
@@ -833,6 +850,7 @@ struct llm_graph_params {
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
             ubatch.is_mixed()   == other.ubatch.is_mixed() &&
+            (ubatch.tree_parent != nullptr) == (other.ubatch.tree_parent != nullptr) &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||

@@ -2526,6 +2526,9 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // token tree: the window of output token t is the columns idx[0..d_conv-1, t] of sx (idx: I32 [d_conv, n_t])
+    GGML_API void ggml_ssm_conv_set_tree(struct ggml_tensor * a, struct ggml_tensor * idx);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2661,6 +2664,15 @@ extern "C" {
 
     // hint for a gated_delta_net result: only slot 0 and slot K-1 are read, backends may skip the other snapshots
     GGML_API void ggml_gated_delta_net_set_ends_only(struct ggml_tensor * a, bool ends_only);
+
+    // token tree (K == 1): paths is I32 [path_len, n_paths], each column a walk over tree nodes, -1 ends it. an entry is
+    // row | depth << 16 | flags: the node at that depth continues from the state after the previous entry if that one is
+    // its parent (depth - 1), else from the state saved at depth - 1 (GGML_GDN_TREE_SAVE) or from the initial state (depth 0).
+    // the walk that has GGML_GDN_TREE_OWN on a row writes the output of that row. only walk 0 writes its final state, and only if write_state.
+    #define GGML_GDN_TREE_OWN       (1 << 30)
+    #define GGML_GDN_TREE_SAVE      (1 << 29)
+    #define GGML_GDN_TREE_MAX_DEPTH 8 // a saved node has a depth below this
+    GGML_API void ggml_gated_delta_net_set_tree(struct ggml_tensor * a, struct ggml_tensor * paths, bool write_state);
 
     // DSA lightning indexer
     //

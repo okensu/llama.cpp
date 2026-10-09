@@ -5691,6 +5691,13 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+void ggml_ssm_conv_set_tree(struct ggml_tensor * a, struct ggml_tensor * idx) {
+    GGML_ASSERT(a->op == GGML_OP_SSM_CONV);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && ggml_is_contiguous(idx));
+    GGML_ASSERT(idx->ne[0] == a->src[1]->ne[0] && idx->ne[1] == a->ne[1] && a->ne[2] == 1);
+    a->src[2] = idx;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6430,6 +6437,15 @@ struct ggml_tensor * ggml_gated_delta_net(
 void ggml_gated_delta_net_set_ends_only(struct ggml_tensor * a, bool ends_only) {
     GGML_ASSERT(a->op == GGML_OP_GATED_DELTA_NET);
     ggml_set_op_params_i32(a, 1, ends_only ? 1 : 0);
+}
+
+void ggml_gated_delta_net_set_tree(struct ggml_tensor * a, struct ggml_tensor * paths, bool write_state) {
+    GGML_ASSERT(a->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ggml_get_op_params_i32(a, 0) == 1);
+    GGML_ASSERT(paths->type == GGML_TYPE_I32 && ggml_is_contiguous(paths) && ggml_is_matrix(paths));
+    GGML_ASSERT(a->src[2]->ne[3] == 1);
+    a->src[6] = paths;
+    ggml_set_op_params_i32(a, 2, write_state ? 1 : 0);
 }
 
 // ggml_lightning_indexer

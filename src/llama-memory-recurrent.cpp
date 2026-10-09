@@ -605,6 +605,164 @@ bool llama_memory_recurrent::rs_recompute_cell(uint32_t cell_id, uint32_t m) {
     return true;
 }
 
+bool llama_memory_recurrent::tree_accept(llama_seq_id seq_id, const int32_t * rows, int32_t n_rows, llama_pos pos_last) {
+    if (!rs_recompute || seq_id < 0 || seq_id >= (llama_seq_id) size || n_rows <= 0) {
+        return false;
+    }
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+    auto & cell = cells[tail_id];
+    if (cell.seq_id.size() != 1 || (uint32_t) n_rows > cell.rs_n_last) {
+        return false;
+    }
+    for (int32_t i = 0; i < n_rows; ++i) {
+        if (rows[i] < 0 || (uint32_t) rows[i] >= cell.rs_n_last) {
+            return false;
+        }
+    }
+    if (!rs_recompute_cell_rows((uint32_t) tail_id, rows, (uint32_t) n_rows)) {
+        return false;
+    }
+    cell.pos       = pos_last;
+    cell.rs_n_last = 0;
+    return true;
+}
+
+bool llama_memory_recurrent::rs_recompute_cell_rows(uint32_t cell_id, const int32_t * rows, uint32_t m) {
+    GGML_ASSERT(rs_recompute && m >= 1 && m <= rs_n_keep && cell_id < size);
+
+    const int64_t S_k  = hparams.ssm_d_state;
+    const int64_t H_k  = hparams.ssm_n_group;
+    const int64_t H_v  = hparams.ssm_dt_rank;
+    const int64_t S_v  = hparams.ssm_d_inner / H_v;
+    const int64_t n_ch = hparams.ssm_d_inner + 2*H_k*S_k;
+    const int64_t n_cw = hparams.ssm_d_conv - 1;
+    const int64_t D    = S_v*S_v*H_v;
+    const int64_t n_k  = rs_n_keep;
+    GGML_ASSERT(n_cw*n_ch == (int64_t) hparams.n_embd_r() && D == (int64_t) hparams.n_embd_s());
+
+    std::map<ggml_backend_dev_t, std::vector<int>> layers_by_dev;
+    for (int il = 0; il < (int) s_l.size(); ++il) {
+        if (s_l[il] != nullptr) {
+            layers_by_dev[ggml_backend_buft_get_device(ggml_backend_buffer_get_type(s_l[il]->buffer))].push_back(il);
+        }
+    }
+
+    for (const auto & [dev, layers] : layers_by_dev) {
+        ggml_backend_t ctx_backend = nullptr;
+        for (ggml_backend_t b : ctx_backends) {
+            if (dev != nullptr && ggml_backend_get_device(b) == dev) {
+                ctx_backend = b;
+            }
+        }
+
+        ggml_backend_t & backend = ctx_backend ? ctx_backend : rc_backends[dev];
+        if (backend == nullptr) {
+            backend = dev ? ggml_backend_dev_init(dev, nullptr) : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            if (backend == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to initialize a backend for the recurrent state recompute\n", __func__);
+                return false;
+            }
+        }
+
+        // bit 31 of the key keeps these graphs apart from the rs_recompute_cell() ones
+        const auto key = std::make_tuple(dev, cell_id, m | (1u << 31));
+        rs_rc_graph & rc = rc_graphs[key];
+        if (rc.gf == nullptr) {
+            const size_t n_max = 32*layers.size() + 16;
+            ggml_init_params params = {
+                /*.mem_size   =*/ n_max*ggml_tensor_overhead() + ggml_graph_overhead_custom(n_max, false),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            rc.ctx.reset(ggml_init(params));
+            ggml_context * ctx = rc.ctx.get();
+            rc.gf = ggml_new_graph_custom(ctx, n_max, false);
+
+            rc.rows_gdn  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, m, 1);
+            rc.rows_conv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_cw);
+            ggml_set_input(rc.rows_gdn);
+            ggml_set_input(rc.rows_conv);
+
+            for (const int il : layers) {
+                ggml_tensor * r = r_l[il];
+                ggml_tensor * s = s_l[il];
+
+                ggml_tensor * r_cur = ggml_view_2d(ctx, r, n_cw, n_ch, n_cw*ggml_element_size(r), cell_id*r->nb[1]);
+                ggml_tensor * s_cur = ggml_view_4d(ctx, s, S_v, S_v, H_v, 1,
+                        S_v*ggml_element_size(s), S_v*S_v*ggml_element_size(s), D*ggml_element_size(s), cell_id*s->nb[1]);
+
+                // all recorded rows of this cell, the path picks the rows to run
+                auto rin = [&](int j, int64_t ne0, int64_t ne1) {
+                    ggml_tensor * t = rin_l[j][il];
+                    return ggml_view_4d(ctx, t, ne0, ne1, n_k, 1,
+                            ne0*ggml_element_size(t), t->nb[1], t->nb[1]*n_k, (size_t) cell_id*n_k*t->nb[1]);
+                };
+
+                ggml_tensor * out = ggml_gated_delta_net(ctx,
+                        rin(RS_IN_Q, S_k, H_k), rin(RS_IN_K, S_k, H_k), rin(RS_IN_V, S_v, H_v),
+                        rin(RS_IN_G, 1, H_v), rin(RS_IN_B, 1, H_v), s_cur, /*K=*/1);
+                ggml_gated_delta_net_set_tree(out, rc.rows_gdn, true);
+
+                ggml_tensor * new_state = ggml_view_2d(ctx, out, D, 1, D*ggml_element_size(out), S_v*H_v*n_k*ggml_element_size(out));
+                ggml_build_forward_expand(rc.gf, ggml_cpy(ctx, new_state, ggml_view_2d(ctx, s, D, 1, s->nb[1], cell_id*s->nb[1])));
+
+                // conv state = the last n_cw entries of [conv state | path rows]: only path rows if the path is long enough
+                ggml_tensor * x = rin_l[RS_IN_X][il];
+                x = ggml_view_2d(ctx, x, n_ch, n_k, x->nb[1], (size_t) cell_id*n_k*x->nb[1]);
+                ggml_tensor * u    = m >= n_cw ? x : ggml_concat(ctx, ggml_cont(ctx, ggml_transpose(ctx, r_cur)), x, 1);
+                ggml_tensor * last = ggml_get_rows(ctx, u, rc.rows_conv);
+                ggml_build_forward_expand(rc.gf, ggml_cpy(ctx, ggml_transpose(ctx, last), r_cur));
+            }
+
+            rc.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(rc.galloc, rc.gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate the recurrent state recompute graph\n", __func__);
+                ggml_gallocr_free(rc.galloc);
+                rc_graphs.erase(key);
+                return false;
+            }
+        }
+
+        // the host copies stay alive until the next call, the async upload is ordered on the same stream
+        rc.rows_gdn_h.resize(m);
+        for (uint32_t i = 0; i < m; ++i) {
+            rc.rows_gdn_h[i] = rows[i] | (int32_t) (i << 16) | GGML_GDN_TREE_OWN;
+        }
+        rc.rows_conv_h.resize(n_cw);
+        for (int64_t k = 0; k < n_cw; ++k) {
+            // entry k of the window: a path row, or a conv state column if the path is shorter than the window
+            const int64_t j = (int64_t) m - n_cw + k;
+            if ((int64_t) m >= n_cw) {
+                rc.rows_conv_h[k] = rows[j];
+            } else {
+                rc.rows_conv_h[k] = j >= 0 ? (int32_t) n_cw + rows[j] : (int32_t) (k + m);
+            }
+        }
+        if (ctx_backend) {
+            ggml_backend_tensor_set_async(backend, rc.rows_gdn,  rc.rows_gdn_h.data(),  0, m*sizeof(int32_t));
+            ggml_backend_tensor_set_async(backend, rc.rows_conv, rc.rows_conv_h.data(), 0, n_cw*sizeof(int32_t));
+        } else {
+            ggml_backend_tensor_set(rc.rows_gdn,  rc.rows_gdn_h.data(),  0, m*sizeof(int32_t));
+            ggml_backend_tensor_set(rc.rows_conv, rc.rows_conv_h.data(), 0, n_cw*sizeof(int32_t));
+        }
+
+        if (ggml_backend_graph_compute_async(backend, rc.gf) != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: recurrent state recompute failed\n", __func__);
+            return false;
+        }
+        if (ctx_backend) {
+            rc_pending = true;
+        } else {
+            ggml_backend_synchronize(backend);
+        }
+    }
+
+    return true;
+}
+
 void llama_memory_recurrent::rc_sync() {
     if (!rc_pending) {
         return;
@@ -854,7 +1012,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        // a token tree ubatch has several nodes per position, see tree_accept()
+        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens && !ubatch.tree_parent) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",

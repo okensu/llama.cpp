@@ -112,6 +112,9 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+
+    // after a decode of a token tree ubatch: keep the given rows of it (a root-to-node path), drop the other nodes
+    virtual bool tree_accept(llama_seq_id seq_id, const int32_t * rows, int32_t n_rows) { GGML_UNUSED(seq_id); GGML_UNUSED(rows); GGML_UNUSED(n_rows); return false; }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;

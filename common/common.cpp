@@ -2170,6 +2170,14 @@ int32_t common_batch::add(llama_token id, llama_pos pos, const std::vector<llama
     return idx;
 }
 
+bool common_batch::set_tree_parent(int32_t idx, int32_t parent) {
+    if (idx < 0 || idx >= size() || parent < -1 || parent >= idx) {
+        return false;
+    }
+    tokens[idx].tree_parent = parent;
+    return true;
+}
+
 bool common_batch::add_seq(int32_t idx, llama_seq_id seq_id) {
     if (idx < 0 || idx >= size()) {
         return false;
@@ -2242,6 +2250,12 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
+        }
+        if (t.tree_parent != -2) {
+            const int32_t parent = t.tree_parent < 0 ? -1 : t.tree_parent - off;
+            if (!llama_batch_ext_set_tree_parent(res, idx, parent)) {
+                GGML_ABORT("%s: invalid tree parent %d of the entry at index %d\n", __func__, t.tree_parent, i);
+            }
         }
     }
 

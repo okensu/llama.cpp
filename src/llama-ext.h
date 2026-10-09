@@ -114,6 +114,15 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Token tree (speculative tree verification): entry idx is a child of the entry parent (-1 for the root, entry 0)
+// Set it for every entry of a batch of one sequence; the attention of a node sees only the context and its ancestors
+// After the decode, llama_memory_tree_accept() keeps one root-to-node path
+LLAMA_API bool llama_batch_ext_set_tree_parent(struct llama_batch_ext * batch, int32_t idx, int32_t parent);
+
+// After the decode of a token tree batch: keep the entries rows[0..n_rows-1] (the root, then each next node a child of the previous), drop the others
+// Returns false if the memory cannot do it (then the memory is unchanged)
+LLAMA_API bool llama_memory_tree_accept(llama_memory_t mem, llama_seq_id seq_id, const int32_t * rows, int32_t n_rows);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

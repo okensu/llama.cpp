@@ -98,6 +98,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
+
+    // token tree ubatch: conv windows and paths, created once per graph
+    llm_graph_input_tree * build_inp_tree();
+
+    llm_graph_input_tree * inp_tree = nullptr;
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

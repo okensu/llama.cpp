@@ -136,6 +136,12 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+
+    // after a token tree ubatch: keep the cells of the given rows, free the other cells of the tree
+    bool tree_accept(llama_seq_id seq_id, const int32_t * rows, int32_t n_rows) override;
+
+    // position of a row of the last token tree ubatch, -1 if none
+    llama_pos tree_pos(int32_t row) const;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -301,6 +307,10 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
+
+    // cells of the rows of the last token tree ubatch (stream tree_strm), see tree_accept()
+    std::vector<uint32_t> tree_cells;
+    uint32_t              tree_strm = 0;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;

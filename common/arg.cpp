@@ -4179,6 +4179,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
+        {"--spec-draft-tree-n"}, "N",
+        string_format("draft a token tree of N tokens from the DFlash2 lattice and verify all its branches in one batch, needs LLAMA_RS_RECOMPUTE=1 and --parallel 1 (default: %d, 0 = one chain)", params.speculative.draft.tree_n),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 63) {
+                throw std::invalid_argument("tree n must be between 0 and 63 inclusive");
+            }
+            params.speculative.draft.tree_n = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_TREE_N"));
+    add_opt(common_arg(
+        {"--spec-draft-tree-rho"}, "F",
+        string_format("draft the token tree only if its expected accepted length (from the drafter probabilities) is F times that of the greedy chain, else draft the chain (default: %.2f, 0 = always the tree)", (double) params.speculative.draft.tree_rho),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.tree_rho = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {

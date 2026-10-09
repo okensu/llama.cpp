@@ -4407,6 +4407,14 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_tree_accept(llama_memory_t mem, llama_seq_id seq_id, const int32_t * rows, int32_t n_rows) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->tree_accept(seq_id, rows, n_rows);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,

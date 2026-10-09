@@ -4774,6 +4774,169 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// token tree used by the tree variants of SSM_CONV and GATED_DELTA_NET: node i > 0 has parent (i - 1) / 2 or i - 1
+static std::vector<int32_t> test_tree_parents(int64_t n, int shape) {
+    std::vector<int32_t> parent(n, -1);
+    for (int64_t i = 1; i < n; ++i) {
+        parent[i] = shape == 0 ? (int32_t) (i - 1) / 2 : shape == 1 ? (int32_t) i - 1 : (int32_t) (i % 3 == 0 ? i - 3 : i - 1);
+        parent[i] = std::max<int32_t>(parent[i], 0);
+    }
+    return parent;
+}
+
+// GGML_OP_SSM_CONV with a token tree, see ggml_ssm_conv_set_tree()
+struct test_ssm_conv_tree : public test_case {
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int     shape;
+
+    std::string vars() override {
+        return VARS_TO_STR4(d_conv, d_inner, n_t, shape);
+    }
+
+    test_ssm_conv_tree(int64_t d_conv = 4, int64_t d_inner = 256, int64_t n_t = 8, int shape = 0)
+        : d_conv(d_conv), d_inner(d_inner), n_t(n_t), shape(shape) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1 + n_t, d_inner, 1);
+        ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, d_conv, n_t);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+        ggml_ssm_conv_set_tree(out, idx);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const std::vector<int32_t> parent = test_tree_parents(n_t, shape);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int32_t> data(d_conv*n_t);
+                for (int64_t i = 0; i < n_t; ++i) {
+                    // column of the token k steps back along the ancestors, the conv state columns before the root
+                    int32_t node = (int32_t) i;
+                    int32_t back = 0;
+                    for (int64_t k = 0; k < d_conv; ++k) {
+                        int32_t col;
+                        if (node >= 0) {
+                            col  = (int32_t) (d_conv - 1) + node;
+                            node = parent[node];
+                        } else {
+                            col = (int32_t) (d_conv - 2) - back++;
+                        }
+                        data[i*d_conv + (d_conv - 1 - k)] = col;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_GATED_DELTA_NET with a token tree, see ggml_gated_delta_net_set_tree()
+struct test_gated_delta_net_tree : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_tokens;
+    const int     shape;
+    const bool    write_state;
+    const bool    walks;
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_tokens, shape, write_state, walks);
+    }
+
+    test_gated_delta_net_tree(int64_t head_count = 4, int64_t head_size = 128, int64_t n_tokens = 8, int shape = 0, bool write_state = false, bool walks = false)
+        : head_count(head_count), head_size(head_size), n_tokens(n_tokens), shape(shape), write_state(write_state), walks(walks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_tokens, 1);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_tokens, 1);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, 1);
+        ggml_tensor * paths = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tokens, n_tokens);
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(v,     "v");
+        ggml_set_name(paths, "paths");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        ggml_gated_delta_net_set_tree(out, paths, write_state);
+        if (!write_state) {
+            // the state tail is not written
+            out = ggml_view_1d(ctx, out, head_size*head_count*n_tokens, 0);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const std::vector<int32_t> parent = test_tree_parents(n_tokens, shape);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "paths") == 0) {
+                std::vector<std::vector<int32_t>> children(n_tokens);
+                std::vector<int32_t> depth(n_tokens, 0);
+                for (int64_t i = 1; i < n_tokens; ++i) {
+                    children[parent[i]].push_back((int32_t) i);
+                    depth[i] = depth[parent[i]] + 1;
+                }
+                std::vector<int32_t> data(n_tokens*n_tokens, -1);
+                bool save_ok = true;
+                for (int64_t i = 0; i < n_tokens; ++i) {
+                    save_ok = save_ok && (children[i].size() < 2 || depth[i] < GGML_GDN_TREE_MAX_DEPTH);
+                }
+                if (walks && save_ok) {
+                    // one depth-first walk, saving the nodes with several children
+                    int64_t len = 0;
+                    std::vector<int32_t> stack(1, 0);
+                    while (!stack.empty()) {
+                        const int32_t node = stack.back();
+                        stack.pop_back();
+                        data[len++] = node | (depth[node] << 16) | GGML_GDN_TREE_OWN | (children[node].size() > 1 ? GGML_GDN_TREE_SAVE : 0);
+                        for (size_t c = children[node].size(); c-- > 0;) {
+                            stack.push_back(children[node][c]);
+                        }
+                    }
+                } else {
+                    // one path per leaf
+                    std::vector<bool> owned(n_tokens, false);
+                    int64_t ip = 0;
+                    for (int64_t leaf = n_tokens - 1; leaf >= 0; --leaf) {
+                        if (!children[leaf].empty()) {
+                            continue;
+                        }
+                        std::vector<int32_t> chain;
+                        for (int32_t node = (int32_t) leaf; node >= 0; node = node == 0 ? -1 : parent[node]) {
+                            chain.push_back(node);
+                        }
+                        for (size_t d = 0; d < chain.size(); ++d) {
+                            const int32_t node = chain[chain.size() - 1 - d];
+                            data[ip*n_tokens + d] = node | ((int32_t) d << 16) | (owned[node] ? 0 : GGML_GDN_TREE_OWN);
+                            owned[node] = true;
+                        }
+                        ip++;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -11549,6 +11712,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
+    for (int shape : {0, 1, 2}) {
+        for (int64_t n : {2, 8, 16, 32}) {
+            test_cases.emplace_back(new test_ssm_conv_tree(4, 256, n, shape));
+            test_cases.emplace_back(new test_gated_delta_net_tree(4, 128, n, shape, false));
+            test_cases.emplace_back(new test_gated_delta_net_tree(2, 64, n, shape, true));
+            test_cases.emplace_back(new test_gated_delta_net_tree(4, 128, n, shape, false, true));
+            test_cases.emplace_back(new test_gated_delta_net_tree(2, 64, n, shape, true, true));
+        }
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -12089,6 +12261,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
+    // qwen35 27B verify batches: chain of 8 and 16 tokens, token trees of 16 nodes
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 8, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 16, 1));
+    for (int shape : {0, 1, 2}) {
+        test_cases.emplace_back(new test_gated_delta_net_tree(48, 128, 16, shape, true, false));
+        test_cases.emplace_back(new test_gated_delta_net_tree(48, 128, 16, shape, true, true));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512

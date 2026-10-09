@@ -9933,6 +9933,7 @@ static void ggml_compute_forward_ssm_conv_f32(
         ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // conv_x
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
+    const ggml_tensor * src2 = dst->src[2]; // token tree windows, see ggml_ssm_conv_set_tree()
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -9972,8 +9973,15 @@ static void ggml_compute_forward_ssm_conv_f32(
                 float sumf = 0.0f;
 
                 // d_conv
-                for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                if (src2) {
+                    const int32_t * idx = (const int32_t *) src2->data + i2*nc;
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf += s[idx[i0] - i2 + i1*ncs] * c[i0 + i1*nc];
+                    }
+                } else {
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                    }
                 }
                 x[i1] = sumf;
             }
@@ -11132,6 +11140,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_paths = dst->src[6]; // token tree, see ggml_gated_delta_net_set_tree()
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -11166,11 +11175,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    const int64_t per_thread = S_v + (K > 1 || src_paths ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = K > 1 || src_paths ? (delta + S_v) : nullptr;
+
+    const int64_t path_len    = src_paths ? src_paths->ne[0] : n_tokens;
+    const int64_t n_paths     = src_paths ? src_paths->ne[1] : 1;
+    const bool    write_state = !src_paths || ggml_get_op_params_i32(dst, 2) != 0;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -11204,70 +11217,105 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
         // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = (K > 1)
-            ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        for (int64_t ip = 0; ip < n_paths; ++ip) {
+            const int32_t * path = src_paths ? (const int32_t *) src_paths->data + ip * path_len : nullptr;
 
-        // copy input state into the working buffer and operate in-place
-        // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+            float * s_out = (K > 1 || src_paths)
+                ? state_work
+                : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
-        // attn output pointer for first token of this (head, seq)
-        float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+            // copy input state into the working buffer and operate in-place
+            // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
+            const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
-        for (int64_t t = 0; t < n_tokens; t++) {
-            const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
-            const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
-            const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+            // token tree: states of the saved nodes, per depth
+            thread_local std::vector<float> tree_stack;
+            if (path && tree_stack.size() < (size_t) (GGML_GDN_TREE_MAX_DEPTH * S_v * S_v)) {
+                tree_stack.resize(GGML_GDN_TREE_MAX_DEPTH * S_v * S_v);
+            }
 
-            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
-            const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
-
-            // state is stored transposed: s_out[j*S_v + i] = S[i][j]
-            // so row j of s_out = column j of S (contiguous access)
-
-            if (kda) {
-                // precompute exp(g) into delta scratch (reused below)
-                for (int64_t i = 0; i < S_v; ++i) {
-                    delta[i] = expf(g_d[i]);
+            int64_t depth_prev = -1;
+            for (int64_t it = 0; it < path_len; it++) {
+                int64_t t     = it;
+                bool    own   = true;
+                int64_t depth = 0;
+                if (path) {
+                    if (path[it] < 0) {
+                        break;
+                    }
+                    t     = path[it] & 0xFFFF;
+                    depth = (path[it] >> 16) & 0xFF;
+                    own   = (path[it] & GGML_GDN_TREE_OWN) != 0;
+                    if (depth != depth_prev + 1) {
+                        GGML_ASSERT(depth <= GGML_GDN_TREE_MAX_DEPTH);
+                        memcpy(s_out, depth == 0 ? s_in : tree_stack.data() + (depth - 1) * S_v * S_v, S_v * S_v * sizeof(float));
+                    }
+                    depth_prev = depth;
                 }
-                // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
+
+                // attn output pointer for this token of this (head, seq)
+                float * attn_data = attn_out_base + ((iv3 * n_tokens + t) * H + iv1) * S_v;
+
+                const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
+                const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
+                const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+
+                const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+                const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+
+                // state is stored transposed: s_out[j*S_v + i] = S[i][j]
+                // so row j of s_out = column j of S (contiguous access)
+
+                if (kda) {
+                    // precompute exp(g) into delta scratch (reused below)
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        delta[i] = expf(g_d[i]);
+                    }
+                    // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
+                    for (int64_t j = 0; j < S_v; ++j) {
+                        ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                    }
+                } else {
+                    ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
+                }
+
+                // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
                 for (int64_t j = 0; j < S_v; ++j) {
-                    ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
+                    delta[j] = (v_d[j] - sum) * beta_val;
                 }
-            } else {
-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
-            }
 
-            // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
-            for (int64_t j = 0; j < S_v; ++j) {
-                float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
-                delta[j] = (v_d[j] - sum) * beta_val;
-            }
-
-            // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
-            for (int64_t j = 0; j < S_v; ++j) {
-                ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
-            }
-
-            // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
-            for (int64_t j = 0; j < S_v; ++j) {
-                float sum = 0.0f;
-                ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
-                attn_data[j] = sum * scale;
-            }
-
-            attn_data += S_v * H; // advance to next token
-
-            if (K > 1) {
-                const int64_t target_slot = n_tokens - 1 - t;
-                if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                     (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
+                for (int64_t j = 0; j < S_v; ++j) {
+                    ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
                 }
+
+                // attn_out[j] = sum_i S[i][j] * q[i] = dot(row j of M, q)
+                for (int64_t j = 0; j < S_v && own; ++j) {
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1);
+                    attn_data[j] = sum * scale;
+                }
+
+                if (path && (path[it] & GGML_GDN_TREE_SAVE)) {
+                    GGML_ASSERT(depth < GGML_GDN_TREE_MAX_DEPTH);
+                    memcpy(tree_stack.data() + depth * S_v * S_v, s_out, S_v * S_v * sizeof(float));
+                }
+
+                if (K > 1) {
+                    const int64_t target_slot = n_tokens - 1 - t;
+                    if (target_slot >= 0 && target_slot < K) {
+                        float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
+                                         (iv3 * H + iv1) * S_v * S_v;
+                        memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                    }
+                }
+            }
+
+            if (src_paths && ip == 0 && write_state) {
+                memcpy(state_out_base + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
             }
         }
     }

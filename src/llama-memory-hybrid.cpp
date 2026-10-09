@@ -221,6 +221,21 @@ void llama_memory_hybrid::set_backends(const std::vector<ggml_backend_t> & backe
     mem_recr->set_backends(backends);
 }
 
+bool llama_memory_hybrid::tree_accept(llama_seq_id seq_id, const int32_t * rows, int32_t n_rows) {
+    if (n_rows <= 0) {
+        return false;
+    }
+    const llama_pos pos_last = mem_attn->tree_pos(rows[n_rows - 1]);
+    if (pos_last < 0) {
+        return false;
+    }
+    // the recurrent part may fail without changes, so it goes first
+    if (!mem_recr->tree_accept(seq_id, rows, n_rows, pos_last)) {
+        return false;
+    }
+    return mem_attn->tree_accept(seq_id, rows, n_rows);
+}
+
 llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }

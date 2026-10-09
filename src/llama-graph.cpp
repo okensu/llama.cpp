@@ -257,6 +257,59 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_tree::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->tree_parent && (int64_t) ubatch->n_tokens == n_tokens);
+    GGML_ASSERT(ggml_backend_buffer_is_host(conv_idx->buffer) && ggml_backend_buffer_is_host(paths->buffer));
+
+    const int32_t * parent = ubatch->tree_parent;
+
+    // conv window of node i: its ancestors back to the root, then the conv state columns (column d_conv - 2 is the newest)
+    int32_t * cidx = (int32_t *) conv_idx->data;
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        int32_t node = (int32_t) i;
+        int32_t back = 0;
+        for (int64_t k = 0; k < d_conv; ++k) {
+            int32_t col;
+            if (node >= 0) {
+                col  = (int32_t) (d_conv - 1) + node;
+                node = parent[node];
+            } else {
+                col = (int32_t) (d_conv - 2) - back++;
+            }
+            cidx[i*d_conv + (d_conv - 1 - k)] = col;
+        }
+    }
+
+    // one depth-first walk over the tree; a node with several children saves its state for the later ones
+    // (see ggml_gated_delta_net_set_tree)
+    int32_t * pdata = (int32_t *) paths->data;
+    std::fill(pdata, pdata + n_tokens*n_tokens, -1);
+
+    std::vector<std::vector<int32_t>> children(n_tokens);
+    std::vector<int32_t> depth(n_tokens, 0);
+    for (int64_t i = 1; i < n_tokens; ++i) {
+        children[parent[i]].push_back((int32_t) i);
+        depth[i] = depth[parent[i]] + 1;
+    }
+
+    int64_t len = 0;
+    std::vector<int32_t> stack(1, 0);
+    while (!stack.empty()) {
+        const int32_t node = stack.back();
+        stack.pop_back();
+        const bool save = children[node].size() > 1;
+        GGML_ASSERT(!save || depth[node] < GGML_GDN_TREE_MAX_DEPTH);
+        pdata[len++] = node | (depth[node] << 16) | GGML_GDN_TREE_OWN | (save ? GGML_GDN_TREE_SAVE : 0);
+        for (size_t c = children[node].size(); c-- > 0;) {
+            stack.push_back(children[node][c]);
+        }
+    }
+}
+
+bool llm_graph_input_tree::can_reuse(const llm_graph_params & params) {
+    return params.ubatch.tree_parent != nullptr && (int64_t) params.ubatch.n_tokens == n_tokens;
+}
+
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     bool res = true;
 

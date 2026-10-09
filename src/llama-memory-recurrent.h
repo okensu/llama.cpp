@@ -49,6 +49,9 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+
+    // after a token tree ubatch: keep the recorded rows (a root-to-node path), the last one at position pos_last
+    bool tree_accept(llama_seq_id seq_id, const int32_t * rows, int32_t n_rows, llama_pos pos_last);
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -138,6 +141,9 @@ private:
     // rs_recompute: recompute the state of cell after the first m recorded tokens into plane 0
     bool rs_recompute_cell(uint32_t cell_id, uint32_t m);
 
+    // rs_recompute: recompute the state of cell after the recorded rows (in this order) into plane 0, from plane 0
+    bool rs_recompute_cell_rows(uint32_t cell_id, const int32_t * rows, uint32_t m);
+
     // the context's backends: a recompute on one of them is ordered with the context's graphs on its stream
     std::vector<ggml_backend_t> ctx_backends;
 
@@ -149,6 +155,12 @@ private:
         ggml_context_ptr ctx;
         ggml_cgraph *    gf     = nullptr;
         ggml_gallocr_t   galloc = nullptr;
+
+        // rs_recompute_cell_rows: the recorded rows to run (gated delta net path) and the conv window rows
+        ggml_tensor *        rows_gdn  = nullptr;
+        ggml_tensor *        rows_conv = nullptr;
+        std::vector<int32_t> rows_gdn_h;
+        std::vector<int32_t> rows_conv_h;
     };
 
     // one backend per device holding recurrent layers, and the cached recompute graphs per (device, cell, m)

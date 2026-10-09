@@ -79,6 +79,10 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // set it to accept a token tree: parent of each draft token (index in result, -1 = child of id_last), in
+    // breadth-first order; a drafter that drafts a single chain leaves it empty
+    std::vector<int32_t> * result_parent = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -94,6 +98,9 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// same, for a token tree draft: rows are the accepted path in the verify batch of the sequence (0 = id_last, i + 1 = draft token i)
+void common_speculative_accept_tree(common_speculative * spec, llama_seq_id seq_id, const std::vector<int32_t> & rows);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

@@ -85,6 +85,8 @@ public:
 
     void set_backends(const std::vector<ggml_backend_t> & backends) override;
 
+    bool tree_accept(llama_seq_id seq_id, const int32_t * rows, int32_t n_rows) override;
+
 private:
     const llama_hparams & hparams;
 

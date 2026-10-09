@@ -13,6 +13,23 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t 
 
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
+llm_graph_input_tree * llm_build_delta_net_base::build_inp_tree() {
+    if (inp_tree == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_tree>(hparams.ssm_d_conv, n_tokens);
+
+        inp->conv_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, hparams.ssm_d_conv, n_tokens);
+        ggml_set_input(inp->conv_idx);
+        ggml_set_name(inp->conv_idx, "tree_conv_idx");
+
+        inp->paths = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_tokens);
+        ggml_set_input(inp->paths);
+        ggml_set_name(inp->paths, "tree_paths");
+
+        inp_tree = (llm_graph_input_tree *) res->add_input(std::move(inp));
+    }
+    return inp_tree;
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -478,7 +495,18 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (mctx_cur->get_rs_recompute()) {
+    if (ubatch.tree_parent) {
+        // token tree: the conv state stays as it is, tree_accept() recomputes it from the recorded inputs
+        GGML_ASSERT(mctx_cur->get_rs_recompute() && n_seqs == 1);
+        const int64_t n_keep = mctx_cur->get_rs_n_keep();
+        const int64_t n_tok  = ubatch.n_seq_tokens;
+        GGML_ASSERT(n_tok <= n_keep);
+
+        ggml_tensor * rin = mctx_cur->get_rin_l(il, llama_memory_recurrent::RS_IN_X);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, qkv_tokens,
+                ggml_view_3d(ctx0, rin, rin->ne[0], n_tok, n_seqs,
+                    rin->nb[1], n_keep * rin->nb[1], (size_t) kv_head * n_keep * rin->nb[1])));
+    } else if (mctx_cur->get_rs_recompute()) {
         // [TAG_RECURRENT_ROLLBACK_RECOMPUTE] plane 0 <- conv state after the ubatch,
         // plane 1 <- conv state before its last n_keep tokens, plus the conv inputs of those tokens
         const int64_t n_keep = mctx_cur->get_rs_n_keep();
@@ -599,6 +627,39 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         const int64_t K = n_seq_tokens > n_keep ? n_keep + 1 : 1;
 
         GGML_ASSERT(g->ne[0] == 1 && "rollback recompute supports scalar gates only");
+
+        if (ubatch.tree_parent) {
+            // token tree: one pass per root-to-leaf path from the state before the ubatch; the state stays as it is,
+            // tree_accept() recomputes it from the recorded inputs
+            GGML_ASSERT(n_seq_tokens <= n_keep && n_seqs == 1);
+
+            ggml_tensor * gdn_tree = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, 1);
+            ggml_gated_delta_net_set_tree(gdn_tree, build_inp_tree()->paths, false);
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_tree, il});
+
+            ggml_tensor * output = ggml_view_4d(ctx0, gdn_tree,
+                S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(gdn_tree->type, S_v),
+                ggml_row_size(gdn_tree->type, S_v * H_v),
+                ggml_row_size(gdn_tree->type, S_v * H_v * n_seq_tokens),
+                0);
+            cb(output, "attn_output", il);
+
+            auto record = [&](ggml_tensor * t, int idx) {
+                ggml_tensor * rin = mctx_cur->get_rin_l(il, idx);
+                GGML_ASSERT(rin->ne[0] == t->ne[0] * t->ne[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, t,
+                        ggml_view_3d(ctx0, rin, rin->ne[0], n_seq_tokens, n_seqs,
+                            rin->nb[1], n_keep * rin->nb[1], (size_t) kv_head * n_keep * rin->nb[1])));
+            };
+            record(q, llama_memory_recurrent::RS_IN_Q);
+            record(k, llama_memory_recurrent::RS_IN_K);
+            record(v, llama_memory_recurrent::RS_IN_V);
+            record(g, llama_memory_recurrent::RS_IN_G);
+            record(b, llama_memory_recurrent::RS_IN_B);
+
+            return output;
+        }
 
         ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
         ggml_gated_delta_net_set_ends_only(gdn_out, true);

@@ -372,9 +372,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * beta  = nullptr;
     ggml_tensor * alpha = nullptr;
 
-    // small batches: one matmul over [beta | alpha] rows; larger ones keep two (the batched kernel splits work by row count)
+    // small batches: one matmul over [beta | alpha] rows; larger ones keep two (the batched kernel splits work by row count).
+    // token trees up to the 32 columns of the tensor core matvec too
     ggml_tensor * ba_w = model.layers[il].ssm_beta_alpha_view;
-    if (ba_w && ubatch.n_tokens <= 8 && loras->empty()) {
+    if (ba_w && (ubatch.n_tokens <= 8 || (ubatch.tree_parent && ubatch.n_tokens <= 32)) && loras->empty()) {
         ggml_tensor * ba = ggml_mul_mat(ctx0, ba_w, cur);
         cb(ba, "beta_alpha", il);
 
@@ -423,6 +424,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    if (ubatch.tree_parent) {
+        ggml_ssm_conv_set_tree(conv_output_proper, build_inp_tree()->conv_idx);
+    }
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

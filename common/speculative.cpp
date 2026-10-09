@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <queue>
 #include <unordered_map>
 #include <cinttypes>
 
@@ -211,6 +212,9 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    // token tree draft: called before accept() with the accepted path in the verify batch of the sequence
+    virtual void accept_tree(llama_seq_id /*seq_id*/, const std::vector<int32_t> & /*rows*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1020,6 +1024,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // token tree verify batch per seq: its features are injected in accept_tree(), for the accepted path only
+    struct tree_batch {
+        int32_t   i_beg = -1; // first row of the seq in the batch
+        llama_pos pos0  = 0;
+    };
+    std::vector<tree_batch> tree_batches;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1089,6 +1100,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
 
+        tree_batches.resize(n_seq);
+
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
 
@@ -1132,6 +1145,157 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+    }
+
+    void accept_tree(llama_seq_id seq_id, const std::vector<int32_t> & rows) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || tree_batches[seq_id].i_beg < 0 || rows.empty()) {
+            return;
+        }
+        const tree_batch tb = tree_batches[seq_id];
+        tree_batches[seq_id].i_beg = -1;
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const int32_t n_rows = (int32_t) rows.size();
+
+        batch_inject.clear();
+        if (use_feat_dev && llama_get_layer_inp_dev_n_tokens(ctx_tgt) > 0) {
+            // token ids are the feature rows in the target's GPU buffer
+            for (int32_t k = 0; k < n_rows; ++k) {
+                batch_inject.add(tb.i_beg + rows[k], tb.pos0 + k, seq_id, false);
+            }
+            llama_wait_for(ctx_dft, ctx_tgt);
+            llama_set_inject_from_other(ctx_dft, true);
+            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+            llama_set_inject_from_other(ctx_dft, false);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d\n", __func__, rc);
+            }
+            // the next target decode overwrites the GPU features
+            llama_wait_for(ctx_tgt, ctx_dft);
+            return;
+        }
+
+        features_buf.resize((size_t) n_rows * n_embd_enc);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (!layer) {
+                GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+            }
+            for (int32_t i = 0; i < n_rows; ++i) {
+                float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                const float * src = layer + (size_t) (tb.i_beg + rows[i]) * n_embd_tgt;
+                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+            }
+        }
+        for (int32_t i = 0; i < n_rows; ++i) {
+            const llama_pos p = tb.pos0 + i;
+            const llama_pos pos_arr[4] = { p, p, p, 0 };
+            batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+        }
+        const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+        if (rc != 0) {
+            LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d\n", __func__, rc);
+        }
+    }
+
+    // best-first token tree over the DFlash2 lattice: a node scores the sum of the log-softmax of the
+    // transition scores along its path; the n_tree best nodes, in breadth-first order.
+    // the greedy chain of n_chain tokens (what the chain mode drafts) is used instead if the expected accepted length
+    // (the sum of the node probabilities) of the tree is not tree_rho times that of the chain; then parent is left empty
+    void draft_tree(const float * lattice, int32_t beg, int32_t n_block_tokens, int32_t n_tree, int32_t n_chain,
+            llama_tokens & result, std::vector<int32_t> & parent) const {
+        struct cand {
+            float   score;
+            int32_t pos;
+            int32_t k;
+            int32_t parent;
+        };
+        auto cmp = [](const cand & a, const cand & b) { return a.score < b.score; };
+        std::priority_queue<cand, std::vector<cand>, decltype(cmp)> heap(cmp);
+
+        // log-softmax of the transition scores from predecessor pred to position pos
+        auto log_softmax = [&](int32_t pos, int32_t pred, std::vector<float> & lp) {
+            const float * row = lattice + (size_t) (beg + pos) * n_embd_dec;
+            const float * s   = row + selector_top_k + (size_t) pred * selector_top_k;
+            const float   m   = *std::max_element(s, s + selector_top_k);
+            double sum = 0.0;
+            for (int32_t k = 0; k < selector_top_k; ++k) {
+                sum += std::exp(s[k] - m);
+            }
+            const float lse = m + (float) std::log(sum);
+            lp.resize(selector_top_k);
+            for (int32_t k = 0; k < selector_top_k; ++k) {
+                lp[k] = s[k] - lse;
+            }
+        };
+
+        std::vector<float> lp;
+
+        // the greedy chain and its expected accepted length
+        std::vector<llama_token> chain;
+        double e_chain = 0.0;
+        {
+            int32_t pred  = 0;
+            float   score = 0.0f;
+            for (int32_t pos = 1; pos < n_block_tokens && (int32_t) chain.size() < n_chain; ++pos) {
+                log_softmax(pos, pred, lp);
+                pred   = (int32_t) std::distance(lp.begin(), std::max_element(lp.begin(), lp.end()));
+                score += lp[pred];
+                e_chain += std::exp(score);
+                chain.push_back((llama_token) lattice[(size_t) (beg + pos) * n_embd_dec + pred]);
+            }
+        }
+
+        std::vector<llama_token> tok;
+        std::vector<int32_t>     par;
+        std::vector<int32_t>     depth;
+
+        double e_all = 0.0;
+
+        auto push_children = [&](int32_t pos, int32_t pred, float base, int32_t p) {
+            log_softmax(pos, pred, lp);
+            for (int32_t k = 0; k < selector_top_k; ++k) {
+                heap.push({ base + lp[k], pos, k, p });
+            }
+        };
+
+        push_children(1, 0, 0.0f, -1);
+        while (!heap.empty() && (int32_t) tok.size() < n_tree) {
+            const cand c = heap.top();
+            heap.pop();
+
+            const float * row = lattice + (size_t) (beg + c.pos) * n_embd_dec;
+            const int32_t id  = (int32_t) tok.size();
+            tok.push_back((llama_token) row[c.k]);
+            par.push_back(c.parent);
+            depth.push_back(c.pos);
+            if (c.pos + 1 < n_block_tokens) {
+                push_children(c.pos + 1, c.k, c.score, id);
+            }
+
+            e_all += std::exp(c.score);
+        }
+
+        if ((int32_t) tok.size() <= n_chain || 1.0 + e_all <= params.tree_rho * (1.0 + e_chain)) {
+            result.insert(result.end(), chain.begin(), chain.end());
+            return;
+        }
+
+        std::vector<int32_t> order(tok.size());
+        std::vector<int32_t> remap(tok.size());
+        for (size_t i = 0; i < order.size(); ++i) {
+            order[i] = (int32_t) i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return depth[a] < depth[b]; });
+        for (size_t i = 0; i < order.size(); ++i) {
+            remap[order[i]] = (int32_t) i;
+        }
+        for (int32_t i : order) {
+            result.push_back(tok[i]);
+            parent.push_back(par[i] < 0 ? -1 : remap[par[i]]);
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1195,6 +1359,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (i_batch_beg[seq_id] < 0) {
                 i_batch_beg[seq_id] = k;
             }
+        }
+
+        // token tree: the nodes share positions, inject only the accepted path later
+        if (batch_in.tokens[0].tree_parent != -2) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                tree_batches[seq_id].i_beg = i_batch_beg[seq_id];
+                if (i_batch_beg[seq_id] >= 0) {
+                    tree_batches[seq_id].pos0 = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
+                }
+            }
+            return true;
         }
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -1343,6 +1518,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                if (params.tree_n > 0 && dp.result_parent != nullptr) {
+                    const int32_t n_tree = dp.n_max > 0 ? std::min(params.tree_n, dp.n_max) : params.tree_n;
+                    draft_tree(lattice, beg, n_block_tokens, n_tree, std::min(n_tree, n_block_tokens - 1), result, *dp.result_parent);
+                    if (result.size() < (size_t) params.n_min) {
+                        result.clear();
+                        dp.result_parent->clear();
+                    }
+                    continue;
+                }
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -2666,6 +2851,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                // a token tree verifies all its nodes in one batch
+                n_max = std::max(n_max, spec->draft.tree_n);
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
@@ -3155,6 +3342,7 @@ void common_speculative_draft(common_speculative * spec) {
 
         for (auto & dp : dparams) {
             GGML_ASSERT(!dp.drafting || dp.result->empty());
+            GGML_ASSERT(!dp.drafting || !dp.result_parent || dp.result_parent->empty());
 
             if (dp.drafting) {
                 n_drafting++;
@@ -3196,6 +3384,10 @@ void common_speculative_draft(common_speculative * spec) {
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {
                             dp.result_q->resize(dp.n_max);
+                        }
+                        // a token tree is in breadth-first order, so its first n_max tokens are a tree too
+                        if (dp.result_parent && !dp.result_parent->empty()) {
+                            dp.result_parent->resize(dp.n_max);
                         }
                     }
                 }
@@ -3267,6 +3459,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+void common_speculative_accept_tree(common_speculative * spec, llama_seq_id seq_id, const std::vector<int32_t> & rows) {
+    GGML_ASSERT(!rows.empty());
+
+    for (auto & impl : spec->impls) {
+        impl->accept_tree(seq_id, rows);
+    }
+
+    common_speculative_accept(spec, seq_id, (uint16_t) (rows.size() - 1));
 }
 
 // TODO: support the case of more than one speculative implementations having a state
