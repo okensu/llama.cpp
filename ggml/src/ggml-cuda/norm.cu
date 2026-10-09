@@ -761,6 +761,13 @@ static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, fl
     }
 }
 
+// two contiguous tensors with the same layout: the same memory or no common bytes
+static bool ggml_cuda_fusion_inplace_or_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
+    const uintptr_t a0 = (uintptr_t) a->data;
+    const uintptr_t b0 = (uintptr_t) b->data;
+    return a0 == b0 || a0 + ggml_nbytes(a) <= b0 || b0 + ggml_nbytes(b) <= a0;
+}
+
 bool ggml_cuda_should_fuse_add_rms_norm_mul(const ggml_tensor * add, const ggml_tensor * rms_norm, const ggml_tensor * mul) {
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
     return add->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
@@ -768,7 +775,13 @@ bool ggml_cuda_should_fuse_add_rms_norm_mul(const ggml_tensor * add, const ggml_
         ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) &&
         ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]) && ggml_is_contiguous(add) &&
         ggml_is_contiguous(rms_norm) && ggml_is_contiguous(mul) && ggml_are_same_shape(mul, add) &&
-        ggml_is_contiguous(w) && w->ne[0] == add->ne[0] && ggml_nrows(w) == 1;
+        ggml_is_contiguous(w) && w->ne[0] == add->ne[0] && ggml_nrows(w) == 1 &&
+        // a block reads its row of the add inputs before it writes that row of add and mul: an output may share the
+        // memory of an input only at the same address (in place), with another offset a block would overwrite rows
+        // that other blocks have not read yet
+        ggml_cuda_fusion_inplace_or_disjoint(add, add->src[0]) && ggml_cuda_fusion_inplace_or_disjoint(add, add->src[1]) &&
+        ggml_cuda_fusion_inplace_or_disjoint(mul, add->src[0]) && ggml_cuda_fusion_inplace_or_disjoint(mul, add->src[1]) &&
+        ggml_cuda_fusion_inplace_or_disjoint(mul, add);
 }
 
 void ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {

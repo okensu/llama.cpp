@@ -4817,6 +4817,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
+
+        // add -> rms_norm -> mul runs as one kernel (ggml_cuda_try_fuse): keep the inputs of the add until the mul,
+        // so that the mul result cannot take their memory at another offset (the fusion is skipped if it does)
+        if (add_rms_norm_fusion_enabled()) {
+            for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+                ggml_tensor * add = cgraph->nodes[i];
+                ggml_tensor * mul = cgraph->nodes[i + 2];
+                if (add->op == GGML_OP_ADD && cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && mul->op == GGML_OP_MUL &&
+                        cgraph->nodes[i + 1]->src[0] == add) {
+                    params->add_alloc_dep(params->user_data, add->src[0], mul);
+                    params->add_alloc_dep(params->user_data, add->src[1], mul);
+                    i += 2;
+                }
+            }
+        }
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
                 continue;
