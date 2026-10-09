@@ -380,6 +380,20 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
 
 // ------------------------------------------------------------------------------------------------------------------
 
+// [TAG_FATTN_MMA_Q8_0] 8 q8_0 values (2-byte aligned) -> 4 half2, bit-identical to half(float(q)*float(d)) without the
+// quarter-rate conversions: a byte permute makes the half 1024 + (q + 128) exactly, minus 1152 gives q exactly, and q*d
+// has at most 18 significant bits, so __hmul2 rounds the exact product once, like the float product rounded to half.
+static __device__ __forceinline__ void flash_attn_ext_q8_dequant8(const int8_t * __restrict__ qs, const half d, half2 * h) {
+    const half2 d2  = __half2half2(d);
+    const half2 off = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480)); // 1152
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t w = (uint32_t) *(const uint16_t *) (qs + 2*j) ^ 0x8080u;
+        const uint32_t b = __byte_perm(w, 0x64646464u, 0x5140);
+        h[j] = __hmul2(__hsub2(*(const half2 *) &b, off), d2);
+    }
+}
+
 template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse, bool kv_q8 = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV_row0, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
@@ -416,16 +430,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
             if (valid) {
                 const int e0 = 2*col0 + 8*k; // first element of this 16-byte chunk
                 const block_q8_0 * blk = (const block_q8_0 *) ((const char *) KV_row0 + i_KV*int64_t(stride_KV)*4) + e0/QK8_0;
-                const float d = blk->d;
-                const int8_t * qs = blk->qs + e0 % QK8_0;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    float v0 = qs[2*j + 0];
-                    float v1 = qs[2*j + 1];
-                    v0 *= d;
-                    v1 *= d;
-                    h[j] = make_half2(ggml_cuda_cast<half>(v0), ggml_cuda_cast<half>(v1));
-                }
+                flash_attn_ext_q8_dequant8(blk->qs + e0 % QK8_0, blk->d, h);
             }
             ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_chunk, i), h);
         }
@@ -571,17 +576,8 @@ static __device__ __forceinline__ void flash_attn_ext_q8_raw_convert(const char 
         const int k  = idx - i*chunks_per_row;
         const int e0 = 8*k; // first element of this 16-byte chunk
         const char * blk = raw + i*row_bytes + (e0/QK8_0)*sizeof(block_q8_0);
-        const float d = *(const half *) blk;
-        const int8_t * qs = (const int8_t *) (blk + sizeof(half)) + e0 % QK8_0;
         half2 h[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            float v0 = qs[2*j + 0];
-            float v1 = qs[2*j + 1];
-            v0 *= d;
-            v1 *= d;
-            h[j] = make_half2(ggml_cuda_cast<half>(v0), ggml_cuda_cast<half>(v1));
-        }
+        flash_attn_ext_q8_dequant8((const int8_t *) (blk + sizeof(half)) + e0 % QK8_0, *(const half *) blk, h);
         ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_chunk, i), h);
     }
 }
