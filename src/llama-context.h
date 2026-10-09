@@ -126,6 +126,7 @@ struct llama_context {
     int32_t get_layer_inp_dev_n_tokens() const { return layer_inp_dev_n_tokens; }
 
     void set_inject_from_other(bool value);
+    void set_graph_cache(int32_t n);
 
     // make the next decode/encode of this context wait on the GPU for the work already submitted to other
     void wait_for(llama_context & other);
@@ -416,7 +417,20 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Entries 2.. keep graphs of other shapes (LLAMA_GRAPH_CACHE, default 4 more), so that alternating ubatch shapes
+    // (e.g. speculative verify batches of several sizes) get their graph back instead of building it again.
+    static constexpr int GF_RES_MAX = 10;
+    std::array<llm_graph_result_ptr, GF_RES_MAX> gf_res_prev;
+    std::array<uint64_t, GF_RES_MAX> gf_res_used = {};
+    // backends the graph build assigned to tensors, set again when a cached graph is allocated
+    std::array<std::vector<std::pair<ggml_tensor *, ggml_backend_t>>, GF_RES_MAX> gf_res_backends;
+    // tensors placed in the compute buffers, their addresses are dropped before a cached graph is allocated again
+    std::array<std::vector<ggml_tensor *>, GF_RES_MAX> gf_res_compute;
+    // inputs of the nodes as built (the scheduler replaces some with its copies)
+    std::array<std::vector<ggml_tensor *>, GF_RES_MAX> gf_res_srcs;
+    uint64_t gf_res_tick = 0;
+    int      gf_res_n_cache = -1;
+    int      gf_res_n_cache_req = 0;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;

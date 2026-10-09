@@ -1328,6 +1328,11 @@ bool llama_context::set_layer_inp_dev(const int32_t * lids, int32_t n) {
     return true;
 }
 
+void llama_context::set_graph_cache(int32_t n) {
+    gf_res_n_cache_req = n;
+    gf_res_n_cache     = -1; // resolved at the next ubatch
+}
+
 void llama_context::set_inject_from_other(bool value) {
     cparams.inject_from_other = value;
 }
@@ -1517,14 +1522,40 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
-    auto * gf  = res->get_gf();
+    if (gf_res_n_cache < 0) {
+        const char * e = getenv("LLAMA_GRAPH_CACHE");
+        gf_res_n_cache = cparams.pipeline_parallel ? 0 : std::min(std::max(e ? atoi(e) : gf_res_n_cache_req, 0), GF_RES_MAX - 2);
+    }
 
-    // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by the graph parameters
+    llm_graph_result * res = nullptr;
+    int  slot   = -1;
+    bool cached = false;
+    if (!graph_reuse_disable) {
+        // the graph of the previous ubatch
+        if (gf_res_prev_active != nullptr && gf_res_prev_active->can_reuse(graph_params(gf_res_prev_active, ubatch, mctx, gtype))) {
+            res = gf_res_prev_active;
+        }
+        // an earlier graph of the same shape
+        for (int i = 0; res == nullptr && i < 2 + gf_res_n_cache && gf_res_n_cache > 0; ++i) {
+            auto * r = gf_res_prev[i].get();
+            if (r != nullptr && r != gf_res_prev_active && ggml_graph_n_nodes(r->get_gf()) > 0 &&
+                r->can_reuse(graph_params(r, ubatch, mctx, gtype))) {
+                res    = r;
+                slot   = i;
+                cached = true;
+            }
+        }
+    }
+    for (int i = 0; i < GF_RES_MAX; ++i) {
+        if (res != nullptr && gf_res_prev[i].get() == res) {
+            slot = i;
+        }
+    }
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    ggml_cgraph * gf = nullptr;
+
+    if (res != nullptr && !cached) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1534,24 +1565,31 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        gf = res->get_gf();
         n_reused++;
-    } else {
+    } else if (cached) {
+        // allocate the cached graph again: drop its compute buffer addresses, the scheduler assigns them again
+        // (the same layout as before unless the buffers were reallocated in between)
         gf_res_prev_active = nullptr;
-        res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        for (const auto & [t, backend] : gf_res_backends[slot]) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), t, backend);
+        }
 
-        //const auto t_start_us = ggml_time_us();
-
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-
-        if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
+        gf = res->get_gf();
+        // the scheduler replaced inputs of the nodes with its copies for other backends: the original inputs again
+        const auto & srcs = gf_res_srcs[slot];
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                node->src[j] = srcs[(size_t) i*GGML_MAX_SRC + j];
+            }
+        }
+        for (ggml_tensor * t : gf_res_compute[slot]) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1561,7 +1599,86 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        n_reused++;
+    } else {
+        // build the graph in the least recently used entry (without the cache: the entry for batches with/without outputs)
+        slot = n_outputs > 0;
+        if (gf_res_n_cache > 0) {
+            for (int i = 0; i < 2 + gf_res_n_cache; ++i) {
+                if (!gf_res_prev[i] || gf_res_used[i] < gf_res_used[slot]) {
+                    slot = i;
+                    if (!gf_res_prev[i]) {
+                        break;
+                    }
+                }
+            }
+        }
+        if (!gf_res_prev[slot]) {
+            gf_res_prev[slot].reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        res = gf_res_prev[slot].get();
+
+        gf_res_prev_active = nullptr;
+        res->reset();
+
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        //const auto t_start_us = ggml_time_us();
+
+        gf = model.build_graph(graph_params(res, ubatch, mctx, gtype));
+
+        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        // the inputs of the nodes and the backends the build assigned, for a later allocation of this graph from the cache
+        gf_res_backends[slot].clear();
+        gf_res_srcs[slot].clear();
+        if (gf_res_n_cache > 0) {
+            gf_res_srcs[slot].resize((size_t) ggml_graph_n_nodes(gf)*GGML_MAX_SRC);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    gf_res_srcs[slot][(size_t) i*GGML_MAX_SRC + j] = node->src[j];
+                }
+                if (ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), node)) {
+                    gf_res_backends[slot].emplace_back(node, b);
+                }
+            }
+        }
+
+        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
+        gf_res_compute[slot].clear();
+        if (gf_res_n_cache > 0) {
+            std::unordered_set<ggml_tensor *> seen;
+            auto add = [&](ggml_tensor * t) {
+                if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                    seen.insert(t).second) {
+                    gf_res_compute[slot].push_back(t);
+                }
+            };
+            // the original inputs, not the copies of the scheduler (they belong to its context)
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    add(gf_res_srcs[slot][(size_t) i*GGML_MAX_SRC + j]);
+                }
+                add(ggml_graph_node(gf, i));
+            }
+        }
+
+        gf_res_prev_active = res;
     }
+    gf_res_used[slot] = ++gf_res_tick;
 
     // set the input data for the input tensors
     {
@@ -4740,6 +4857,10 @@ int32_t llama_get_layer_inp_dev_n_tokens(struct llama_context * ctx) {
 
 void llama_set_inject_from_other(struct llama_context * ctx, bool value) {
     ctx->set_inject_from_other(value);
+}
+
+void llama_set_graph_cache(struct llama_context * ctx, int32_t n) {
+    ctx->set_graph_cache(n);
 }
 
 void llama_wait_for(struct llama_context * ctx, struct llama_context * other) {

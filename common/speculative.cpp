@@ -1142,6 +1142,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         LOG_INF("%s: - target features on GPU: %s\n", __func__, use_feat_dev ? "yes" : "no");
 
+        // the drafter alternates between feature injection and draft batches (and injections of several lengths):
+        // keep their graphs instead of building them for every call
+        llama_set_graph_cache(ctx_dft, 4);
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise

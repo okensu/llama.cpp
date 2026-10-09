@@ -148,6 +148,10 @@ LLAMA_API int32_t llama_get_layer_inp_dev_n_tokens(struct llama_context * ctx);
 // DFlash draft: inject the target features from ctx_other's GPU copy, batch token ids are the row indices
 LLAMA_API void llama_set_inject_from_other(struct llama_context * ctx, bool value);
 
+// keep the graphs of up to n earlier ubatch shapes (default 0, LLAMA_GRAPH_CACHE overrides), so that a context whose
+// ubatch shapes alternate (e.g. a drafter: feature injection and draft) gets them back instead of building them again
+LLAMA_API void llama_set_graph_cache(struct llama_context * ctx, int32_t n);
+
 // the next decode/encode of ctx waits on the GPU for the work already submitted to other
 LLAMA_API void llama_wait_for(struct llama_context * ctx, struct llama_context * other);
 
