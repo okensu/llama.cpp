@@ -1003,7 +1003,15 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
-    return talloc->size_max >= node_size;
+    // a smaller tensor fits the previous layout, but then the layout of a graph depends on the graphs before it;
+    // with an exact match each graph shape always gets the same addresses (backends that record graphs, e.g. CUDA
+    // graphs, can keep them when graphs of several shapes alternate)
+    static int exact = -1;
+    if (exact < 0) {
+        const char * e = getenv("GGML_GALLOC_EXACT");
+        exact = e == NULL || atoi(e) != 0;
+    }
+    return exact && node_size > 0 ? talloc->size_max == node_size : talloc->size_max >= node_size;
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
