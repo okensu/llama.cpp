@@ -263,6 +263,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // A ratio that is not a multiple of the column group pads the group (6 -> 8 heads wastes a quarter of the matrix
+    // multiplications). With enough tokens to fill the columns, a group that divides the ratio costs only mask I/O.
+    static const bool gqa_exact = [] {
+        const char * e = getenv("GGML_CUDA_FA_GQA_EXACT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (gqa_exact && use_gqa_opt && gqa_ratio > 4 && gqa_ratio % 8 != 0 && Q->ne[1] >= 32) {
+        if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
