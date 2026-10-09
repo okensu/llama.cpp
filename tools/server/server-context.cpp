@@ -4441,11 +4441,13 @@ private:
                 }
 
                 if (is_tree) {
+                    // the drafter first: its injection waits only for the verify, and the recompute of the target state
+                    // (on the target stream) then runs while the drafter drafts
+                    common_speculative_accept_tree(spec.get(), slot.id, tree_rows);
                     // keep the accepted path of the tree in the target memory
                     if (!llama_memory_tree_accept(llama_get_memory(slot.ctx_tgt), slot.id, tree_rows.data(), (int32_t) tree_rows.size())) {
                         GGML_ABORT("failed to accept the token tree path of slot %d\n", slot.id);
                     }
-                    common_speculative_accept_tree(spec.get(), slot.id, tree_rows);
                     slot.spec_draft_parent.clear();
                 } else {
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
